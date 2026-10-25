@@ -1,0 +1,20 @@
+[Unit]
+Description=Shahid VIP Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/shahid-bot
+EnvironmentFile=-/opt/shahid-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HEADLESS=0
+# Runs in headful mode using Xvfb virtual frame-buffer (or directly via python)
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1920x1080x24 -ac" /opt/shahid-bot/.venv/bin/python /opt/shahid-bot/bot.py
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
