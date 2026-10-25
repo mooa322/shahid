@@ -15,13 +15,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def shot(name):
     return os.path.join(BASE_DIR, name)
 
-async def human_type(page, locator, text: str):
-    await locator.click()
-    for char in text:
-        await page.keyboard.type(char)
-        await asyncio.sleep(random.uniform(0.04, 0.08))
-
 async def remove_cookie_banner(page):
+    try:
+        accept_btn = page.locator('#onetrust-accept-btn-handler')
+        if await accept_btn.is_visible(timeout=1000):
+            await accept_btn.click(timeout=1500)
+            await asyncio.sleep(0.3)
+    except Exception:
+        pass
     try:
         await page.evaluate("""() => {
             const ids = ['onetrust-banner-sdk', 'onetrust-consent-sdk', 'onetrust-style'];
@@ -29,10 +30,21 @@ async def remove_cookie_banner(page):
                 const el = document.getElementById(id);
                 if (el) el.remove();
             });
-            document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-banner-sdk').forEach(el => el.remove());
+            document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-banner-sdk, #onetrust-consent-sdk, .ot-fade-in').forEach(el => el.remove());
         }""")
     except Exception:
         pass
+
+async def human_type(page, locator, text: str):
+    await remove_cookie_banner(page)
+    try:
+        await locator.click(timeout=3000)
+    except Exception:
+        await remove_cookie_banner(page)
+        await locator.click(force=True)
+    for char in text:
+        await page.keyboard.type(char)
+        await asyncio.sleep(random.uniform(0.04, 0.08))
 
 async def handle_skip(page):
     """Clicks 'تخطى وابدأ المشاهدة' if it appears on screen."""
@@ -226,7 +238,12 @@ async def main():
     await user_input.wait_for(state="visible", timeout=10000)
     await human_type(page, user_input, email)
     await asyncio.sleep(1.0)
-    await page.locator("button[type='submit']").click()
+    await remove_cookie_banner(page)
+    submit_btn = page.locator("button[type='submit']")
+    try:
+        await submit_btn.click(timeout=3000)
+    except Exception:
+        await submit_btn.click(force=True)
     print("[*] Submitted email, polling for OTP...", flush=True)
 
     otp = await asyncio.to_thread(poll_for_otp, token, 60)
@@ -239,7 +256,12 @@ async def main():
     await otp_input.wait_for(state="visible", timeout=10000)
     await human_type(page, otp_input, otp)
     await asyncio.sleep(1.0)
-    await page.locator("button[type='submit']").click()
+    await remove_cookie_banner(page)
+    submit_btn = page.locator("button[type='submit']")
+    try:
+        await submit_btn.click(timeout=3000)
+    except Exception:
+        await submit_btn.click(force=True)
     print("[*] Submitted OTP. Waiting for set-password...", flush=True)
 
     # 2. Password & Checkboxes

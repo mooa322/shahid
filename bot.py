@@ -697,16 +697,15 @@ async def cleanup_session(context: ContextTypes.DEFAULT_TYPE, force: bool = Fals
         context.user_data.pop("session", None)
 
 
-async def human_type_locator(page: Page, locator, text: str) -> None:
-    """Type text into a Playwright locator with human delays."""
-    await locator.click()
-    for char in text:
-        await page.keyboard.type(char)
-        await asyncio.sleep(random.uniform(0.04, 0.09))
-
-
 async def remove_cookie_banner(page: Page) -> None:
-    """Removes OneTrust cookie banner overlay."""
+    """Removes OneTrust cookie banner overlay and accepts cookies if prompt exists."""
+    try:
+        accept_btn = page.locator("#onetrust-accept-btn-handler")
+        if await accept_btn.is_visible(timeout=1000):
+            await accept_btn.click(timeout=1500)
+            await asyncio.sleep(0.3)
+    except Exception:
+        pass
     try:
         await page.evaluate("""() => {
             const ids = ['onetrust-banner-sdk', 'onetrust-consent-sdk', 'onetrust-style'];
@@ -714,10 +713,23 @@ async def remove_cookie_banner(page: Page) -> None:
                 const el = document.getElementById(id);
                 if (el) el.remove();
             });
-            document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-banner-sdk').forEach(el => el.remove());
+            document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-banner-sdk, #onetrust-consent-sdk, .ot-fade-in').forEach(el => el.remove());
         }""")
     except Exception:
         pass
+
+
+async def human_type_locator(page: Page, locator, text: str) -> None:
+    """Type text into a Playwright locator with human delays."""
+    await remove_cookie_banner(page)
+    try:
+        await locator.click(timeout=3000)
+    except Exception:
+        await remove_cookie_banner(page)
+        await locator.click(force=True)
+    for char in text:
+        await page.keyboard.type(char)
+        await asyncio.sleep(random.uniform(0.04, 0.09))
 
 
 async def handle_skip_onboarding(page: Page) -> None:
@@ -1093,7 +1105,12 @@ async def automate_all_profiles(page: Page, status_msg, base_name: str = "dahoom
 
 async def human_type(page: Page, selector: str, text: str) -> None:
     """Type characters with random human-like intervals to evade heuristic detection."""
-    await page.click(selector)
+    await remove_cookie_banner(page)
+    try:
+        await page.locator(selector).click(timeout=3000)
+    except Exception:
+        await remove_cookie_banner(page)
+        await page.locator(selector).click(force=True)
     for char in text:
         await page.keyboard.type(char)
         await asyncio.sleep(random.uniform(0.03, 0.09))
@@ -1568,21 +1585,29 @@ async def launch_browser_and_request_otp(msg_target, session: RegistrationSessio
         # Navigate to registration hub
         await page.goto("https://shahid.mbc.net/ar/hub/registration", wait_until="domcontentloaded")
         await asyncio.sleep(2)
+        await remove_cookie_banner(page)
 
         # Enter email with human-like typing
         user_field = page.locator("#userName")
         if not await user_field.is_visible():
-            await user_field.wait_for(timeout=5000)
+            await user_field.wait_for(timeout=7000)
 
+        await remove_cookie_banner(page)
         await human_type(page, "#userName", session.email)
         await asyncio.sleep(0.5)
 
         # Click submit
+        await remove_cookie_banner(page)
         submit_btn = page.locator("button[type='submit']")
-        await submit_btn.click()
+        try:
+            await submit_btn.click(timeout=3000)
+        except Exception:
+            await remove_cookie_banner(page)
+            await submit_btn.click(force=True)
 
         # Wait for transition
         await asyncio.sleep(4)
+        await remove_cookie_banner(page)
 
         # First: Check if we successfully reached the OTP verification page
         otp_field = page.locator("#otpCode")
@@ -1655,6 +1680,7 @@ async def launch_browser_and_request_otp(msg_target, session: RegistrationSessio
         return CODE
 
     except Exception as exc:
+        logger.error(f"[!] Error in launch_browser_and_request_otp: {exc}", exc_info=True)
         await status_msg.edit_text(
             "⚠️ تعذر الاتصال بموقع شاهد حالياً، يرجى المحاولة مجدداً.",
             reply_markup=get_cancel_keyboard(),
