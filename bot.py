@@ -1,6 +1,7 @@
 """Telegram bot for automated Shahid VIP account registration."""
 
 import asyncio
+import threading
 import io
 import json
 import logging
@@ -78,6 +79,9 @@ ADMINS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admins.j
 SUBSCRIBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscribers.json")
 QUEUED_EMAILS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queued_emails.json")
 PROXIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.json")
+
+# Thread-safe lock for multi-user concurrent database writes
+_DB_LOCK = threading.Lock()
 PRIMARY_ADMIN_ID = 1291024378
 
 
@@ -119,17 +123,18 @@ def load_admins() -> list:
 
 
 def save_admins(admin_ids: list) -> None:
-    dedup = [PRIMARY_ADMIN_ID]
-    for x in admin_ids:
-        if str(x).isdigit():
-            val = int(x)
-            if val not in dedup:
-                dedup.append(val)
-    try:
-        with open(ADMINS_FILE, "w", encoding="utf-8") as f:
-            json.dump(dedup, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[!] Error saving admins.json: {e}", flush=True)
+    with _DB_LOCK:
+        dedup = [PRIMARY_ADMIN_ID]
+        for x in admin_ids:
+            if str(x).isdigit():
+                val = int(x)
+                if val not in dedup:
+                    dedup.append(val)
+        try:
+            with open(ADMINS_FILE, "w", encoding="utf-8") as f:
+                json.dump(dedup, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[!] Error saving admins.json: {e}", flush=True)
 
 
 def is_admin(user_id: int) -> bool:
@@ -148,11 +153,12 @@ def load_subscribers() -> dict:
 
 
 def save_subscribers(data: dict) -> None:
-    try:
-        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[!] Error saving subscribers.json: {e}", flush=True)
+    with _DB_LOCK:
+        try:
+            with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[!] Error saving subscribers.json: {e}", flush=True)
 
 
 def load_queued_emails() -> dict:
@@ -167,11 +173,12 @@ def load_queued_emails() -> dict:
 
 
 def save_queued_emails(data: dict) -> None:
-    try:
-        with open(QUEUED_EMAILS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[!] Error saving queued_emails.json: {e}", flush=True)
+    with _DB_LOCK:
+        try:
+            with open(QUEUED_EMAILS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[!] Error saving queued_emails.json: {e}", flush=True)
 
 
 def get_user_queued_emails(user_id: int) -> list:
@@ -259,11 +266,12 @@ def load_proxies() -> dict:
 
 
 def save_proxies(data: dict) -> None:
-    try:
-        with open(PROXIES_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[!] Error saving proxies.json: {e}", flush=True)
+    with _DB_LOCK:
+        try:
+            with open(PROXIES_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[!] Error saving proxies.json: {e}", flush=True)
 
 
 def parse_proxy_line(line: str) -> Optional[dict]:
@@ -825,7 +833,8 @@ def load_accounts() -> dict:
 
 
 def save_account(user_id: int, email: str, password: str, profiles: list, proxy: str = "") -> None:
-    data = load_accounts()
+    with _DB_LOCK:
+        data = load_accounts()
     if not isinstance(data, dict):
         data = {}
     uid = str(user_id)
@@ -4961,7 +4970,14 @@ def main() -> None:
     if not token:
         raise SystemExit("Error: TELEGRAM_BOT_TOKEN is missing. Set it in .env file.")
 
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .concurrent_updates(32)
+        .connection_pool_size(64)
+        .pool_timeout(30.0)
+        .build()
+    )
 
     # Security: Global Access Guard (Runs before all other handlers at group -1)
     app.add_handler(TypeHandler(Update, access_guard), group=-1)
