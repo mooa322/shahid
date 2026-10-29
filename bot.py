@@ -3,13 +3,17 @@
 import asyncio
 import io
 import json
+import logging
 import os
 import random
 import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 # Ensure UTF-8 output on Windows consoles
 try:
@@ -55,7 +59,9 @@ load_dotenv()
     INPUT_QUEUED_EMAILS,
     CHOOSE_BATCH_COUNT,
     BATCH_PASSWORD,
-) = range(10)
+    INPUT_PROXIES,
+    CONFIRM_PROXY_MODE,
+) = range(12)
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 BLOCKED_MARKERS = (
@@ -71,6 +77,7 @@ SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settin
 ADMINS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admins.json")
 SUBSCRIBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscribers.json")
 QUEUED_EMAILS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queued_emails.json")
+PROXIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.json")
 PRIMARY_ADMIN_ID = 1291024378
 
 
@@ -238,6 +245,217 @@ def clear_user_queued_emails(user_id: int) -> bool:
         save_queued_emails(data)
         return True
     return False
+
+
+def load_proxies() -> dict:
+    if os.path.exists(PROXIES_FILE):
+        try:
+            with open(PROXIES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[!] Error loading proxies.json: {e}", flush=True)
+            return {}
+    return {}
+
+
+def save_proxies(data: dict) -> None:
+    try:
+        with open(PROXIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[!] Error saving proxies.json: {e}", flush=True)
+
+
+def parse_proxy_line(line: str) -> Optional[dict]:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    proto = "http"
+    if "://" in line:
+        parts_scheme = line.split("://", 1)
+        proto = parts_scheme[0].lower()
+        line = parts_scheme[1]
+
+    if "@" in line:
+        auth_part, host_part = line.split("@", 1)
+        if ":" in auth_part:
+            username, password = auth_part.split(":", 1)
+        else:
+            username, password = auth_part, ""
+        if ":" in host_part:
+            host, port = host_part.split(":", 1)
+        else:
+            host, port = host_part, "80"
+    else:
+        parts = line.split(":")
+        if len(parts) >= 4:
+            host, port, username, password = parts[0], parts[1], parts[2], ":".join(parts[3:])
+        elif len(parts) == 2:
+            host, port = parts[0], parts[1]
+            username, password = "", ""
+        else:
+            return None
+
+    host = host.strip()
+    port = port.strip()
+    username = username.strip()
+    password = password.strip()
+
+    if not host or not port.isdigit():
+        return None
+
+    return {
+        "server": f"{proto}://{host}:{port}",
+        "username": username,
+        "password": password,
+        "host": host,
+        "port": port,
+        "raw": f"{host}:{port}:{username}:{password}" if username else f"{host}:{port}",
+        "is_egypt": True,
+    }
+
+
+def parse_proxies_text(raw_text: str) -> List[dict]:
+    parsed = []
+    seen = set()
+    for line in raw_text.splitlines():
+        p = parse_proxy_line(line)
+        if not p:
+            continue
+        key = f"{p['host']}:{p['port']}"
+        if key not in seen:
+            seen.add(key)
+            parsed.append(p)
+    return parsed
+
+
+def get_user_proxy_info(user_id: int) -> dict:
+    data = load_proxies()
+    uid = str(user_id)
+    if uid in data and data[uid].get("proxies"):
+        return data[uid]
+    if "global" in data and data["global"].get("proxies"):
+        return data["global"]
+    return {"proxies": [], "current_index": 0, "rotation_enabled": True}
+
+
+def get_user_proxies(user_id: int) -> List[dict]:
+    return get_user_proxy_info(user_id).get("proxies", [])
+
+
+def add_user_proxies(user_id: int, new_proxies: List[dict], replace: bool = False) -> tuple[int, int, int]:
+    data = load_proxies()
+    uid = str(user_id)
+    user_entry = data.setdefault(uid, {
+        "proxies": [],
+        "current_index": 0,
+        "rotation_enabled": True,
+    })
+
+    if replace:
+        user_entry["proxies"] = new_proxies
+        user_entry["current_index"] = 0
+        save_proxies(data)
+        return len(new_proxies), 0, len(new_proxies)
+
+    current_proxies = user_entry.get("proxies", [])
+    seen = {f"{p.get('host')}:{p.get('port')}" for p in current_proxies}
+    added = 0
+    duplicates = 0
+
+    for p in new_proxies:
+        key = f"{p.get('host')}:{p.get('port')}"
+        if key in seen:
+            duplicates += 1
+            continue
+        current_proxies.append(p)
+        seen.add(key)
+        added += 1
+
+    user_entry["proxies"] = current_proxies
+    save_proxies(data)
+    return added, duplicates, len(current_proxies)
+
+
+def clear_user_proxies(user_id: int) -> bool:
+    data = load_proxies()
+    uid = str(user_id)
+    if uid in data:
+        data[uid]["proxies"] = []
+        data[uid]["current_index"] = 0
+        save_proxies(data)
+        return True
+    return False
+
+
+def toggle_user_proxy_rotation(user_id: int) -> bool:
+    data = load_proxies()
+    uid = str(user_id)
+    user_entry = data.setdefault(uid, {
+        "proxies": [],
+        "current_index": 0,
+        "rotation_enabled": True,
+    })
+    new_state = not user_entry.get("rotation_enabled", True)
+    user_entry["rotation_enabled"] = new_state
+    save_proxies(data)
+    return new_state
+
+
+def get_next_proxy_for_user(user_id: int) -> Optional[dict]:
+    data = load_proxies()
+    uid = str(user_id)
+
+    target_entry = None
+    if uid in data and data[uid].get("proxies"):
+        target_entry = data[uid]
+    elif "global" in data and data["global"].get("proxies"):
+        target_entry = data["global"]
+
+    if target_entry and target_entry.get("proxies"):
+        proxies_list = target_entry["proxies"]
+        total = len(proxies_list)
+        cur_idx = target_entry.get("current_index", 0)
+        rotation_enabled = target_entry.get("rotation_enabled", True)
+
+        selected_proxy = proxies_list[cur_idx % total]
+
+        if rotation_enabled and total > 1:
+            target_entry["current_index"] = (cur_idx + 1) % total
+            save_proxies(data)
+
+        cfg = {
+            "server": selected_proxy["server"],
+            "host": selected_proxy.get("host", ""),
+            "port": selected_proxy.get("port", ""),
+            "raw": selected_proxy.get("raw", ""),
+            "proxy_index": (cur_idx % total) + 1,
+            "total_proxies": total,
+            "is_egypt": selected_proxy.get("is_egypt", True),
+        }
+        if selected_proxy.get("username"):
+            cfg["username"] = selected_proxy["username"]
+            cfg["password"] = selected_proxy.get("password", "")
+        return cfg
+
+    # Fallback to .env proxy
+    env_server = os.getenv("PROXY_SERVER")
+    if env_server:
+        host = env_server.replace("http://", "").replace("https://", "").split(":")[0]
+        cfg = {
+            "server": env_server,
+            "host": host,
+            "raw": env_server,
+            "proxy_index": 1,
+            "total_proxies": 1,
+            "is_egypt": "eg" in env_server.lower() or "eg" in os.getenv("PROXY_USERNAME", "").lower(),
+        }
+        if os.getenv("PROXY_USERNAME"):
+            cfg["username"] = os.getenv("PROXY_USERNAME")
+            cfg["password"] = os.getenv("PROXY_PASSWORD", "")
+        return cfg
+
+    return None
 
 
 def add_or_renew_subscriber(user_id: int, days: int, note: str = "", created_by: int = 0) -> dict:
@@ -446,7 +664,25 @@ def get_user_settings(user_id: int) -> dict:
         "perm_password": "",
         "perm_name_enabled": False,
         "perm_name": "",
+        "create_profiles_enabled": True,
     })
+
+
+def toggle_user_create_profiles(user_id: int) -> bool:
+    data = load_settings()
+    uid = str(user_id)
+    if uid not in data:
+        data[uid] = {
+            "perm_pass_enabled": False,
+            "perm_password": "",
+            "perm_name_enabled": False,
+            "perm_name": "",
+            "create_profiles_enabled": True,
+        }
+    cur = data[uid].get("create_profiles_enabled", True)
+    data[uid]["create_profiles_enabled"] = not cur
+    save_settings(data)
+    return data[uid]["create_profiles_enabled"]
 
 
 def set_user_perm_password(user_id: int, password: str) -> None:
@@ -501,17 +737,20 @@ def load_accounts() -> dict:
     return {}
 
 
-def save_account(user_id: int, email: str, password: str, profiles: list) -> None:
+def save_account(user_id: int, email: str, password: str, profiles: list, proxy: str = "") -> None:
     data = load_accounts()
     uid = str(user_id)
     if uid not in data:
         data[uid] = []
-    data[uid].append({
+    account_entry = {
         "email": email,
         "password": password,
         "profiles": profiles,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
+    }
+    if proxy:
+        account_entry["proxy"] = proxy
+    data[uid].append(account_entry)
     try:
         with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -555,6 +794,12 @@ def get_main_inline_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
     queue_len = len(get_user_queued_emails(user_id)) if user_id else 0
     queue_label = f"📬 قائمة الإيميلات ({queue_len})" if queue_len else "📬 قائمة الإيميلات (تلقائي)"
 
+    proxies_len = len(get_user_proxies(user_id)) if user_id else 0
+    proxies_label = f"🌐 إدارة البروكسيات ({proxies_len})" if proxies_len else "🌐 إدارة البروكسيات (تلقائي)"
+
+    create_profiles = get_user_settings(user_id).get("create_profiles_enabled", True) if user_id else True
+    profiles_toggle_label = "👥 تجهيز الملفات: 🟢 مفعّل" if create_profiles else "👥 تجهيز الملفات: 🔴 معطّل"
+
     buttons = [
         [
             InlineKeyboardButton("➕ إنشاء حساب جديد", callback_data="act_create"),
@@ -562,10 +807,14 @@ def get_main_inline_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(queue_label, callback_data="act_email_queue"),
+            InlineKeyboardButton(proxies_label, callback_data="act_proxies"),
         ],
         [
             InlineKeyboardButton("🔐 كلمة المرور الدائمة", callback_data="act_perm_pass"),
             InlineKeyboardButton("👤 اسم الملفات المحفوظ", callback_data="act_perm_name"),
+        ],
+        [
+            InlineKeyboardButton(profiles_toggle_label, callback_data="act_toggle_create_profiles"),
         ],
     ]
     if user_id and is_admin(user_id):
@@ -619,9 +868,22 @@ def get_cancel_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def get_otp_keyboard(show_resend: bool = False) -> InlineKeyboardMarkup:
+    """Returns the inline keyboard for the OTP step.
+    Resend button is preserved in code but hidden from the user by default (show_resend=False).
+    """
+    buttons = []
+    if show_resend:
+        buttons.append([InlineKeyboardButton("🔄 إعادة إرسال الكود", callback_data="act_resend_otp")])
+    buttons.append([InlineKeyboardButton("❌ إلغاء العملية", callback_data="act_cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def get_name_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⏭️ استخدام dahoom الافتراضي", callback_data="act_default_name")],
+        [InlineKeyboardButton("✍️ تسمية الـ 4 ملفات بنفسي (4 أسماء)", callback_data="act_custom_4_names")],
+        [InlineKeyboardButton("🚫 تخطي تسمية الملفات (حساب فقط)", callback_data="act_skip_profiles")],
         [InlineKeyboardButton("❌ إلغاء العملية", callback_data="act_cancel")],
     ])
 
@@ -666,9 +928,13 @@ HELP_TEXT = (
 
 @dataclass
 class RegistrationSession:
+    user_id: int = 0
     email: str = ""
     password: str = ""
     base_name: str = "dahoom"
+    custom_names: Optional[List[str]] = None
+    skip_profiles: bool = False
+    proxy_config: Optional[dict] = None
     playwright: Optional[Playwright] = None
     browser: Optional[Browser] = None
     context: Optional[BrowserContext] = None
@@ -686,57 +952,134 @@ async def cleanup_session(context: ContextTypes.DEFAULT_TYPE, force: bool = Fals
     # Only close browser if force is explicitly True (e.g. /cancel)
     if force:
         try:
-            if session.context:
+            if hasattr(session, "page") and session.page and not session.page.is_closed():
+                await session.page.close()
+        except Exception:
+            pass
+        try:
+            if hasattr(session, "context") and session.context:
                 await session.context.close()
-            if session.browser:
+        except Exception:
+            pass
+        try:
+            if hasattr(session, "browser") and session.browser:
                 await session.browser.close()
-            if session.playwright:
+        except Exception:
+            pass
+        try:
+            if hasattr(session, "playwright") and session.playwright:
                 await session.playwright.stop()
         except Exception:
             pass
-        context.user_data.pop("session", None)
+    context.user_data.pop("session", None)
 
 
-async def remove_cookie_banner(page: Page) -> None:
-    """Removes OneTrust cookie banner overlay and accepts cookies if prompt exists."""
+async def remove_cookie_banner(page: Page) -> bool:
+    """Accepts cookie / privacy consent banners ('موافق') and clears overlays immediately."""
+    clicked = False
+    accept_selectors = [
+        "#onetrust-accept-btn-handler",
+        "button#onetrust-accept-btn-handler",
+        "button:text-is('موافق')",
+        "button:has-text('موافق')",
+        "#accept-recommended-btn-handler",
+        "#onetrust-reject-all-handler",
+        "button:has-text('الضرورية فقط')",
+        "button:has-text('قبول الكل')",
+        "button:has-text('قبول')",
+    ]
+    for sel in accept_selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=400):
+                await loc.click(force=True, timeout=1200)
+                clicked = True
+                await asyncio.sleep(0.3)
+                break
+        except Exception:
+            pass
+
     try:
-        accept_btn = page.locator("#onetrust-accept-btn-handler")
-        if await accept_btn.is_visible(timeout=1000):
-            await accept_btn.click(timeout=1500)
-            await asyncio.sleep(0.3)
-    except Exception:
-        pass
-    try:
-        await page.evaluate("""() => {
-            const ids = ['onetrust-banner-sdk', 'onetrust-consent-sdk', 'onetrust-style'];
-            ids.forEach(id => {
-                const el = document.getElementById(id);
-                if (el) el.remove();
+        js_done = await page.evaluate("""() => {
+            let res = false;
+            if (window.OneTrust && typeof window.OneTrust.AcceptAll === 'function') {
+                try { window.OneTrust.AcceptAll(); res = true; } catch(e) {}
+            }
+            const b = document.getElementById('onetrust-accept-btn-handler') ||
+                      document.getElementById('accept-recommended-btn-handler') ||
+                      Array.from(document.querySelectorAll('button, div[role="button"], a')).find(el => {
+                          const t = (el.innerText || '').trim();
+                          return t === 'موافق' || t === 'قبول الكل' || t === 'الضرورية فقط' || t === 'قبول';
+                      });
+            if (b) {
+                try { b.click(); res = true; } catch(e) {}
+            }
+
+            const sels = ['#onetrust-banner-sdk', '#onetrust-consent-sdk', '#onetrust-pc-sdk', '.onetrust-pc-dark-filter', '.ot-fade-in'];
+            sels.forEach(s => {
+                document.querySelectorAll(s).forEach(e => {
+                    e.style.setProperty('display', 'none', 'important');
+                    e.remove();
+                });
             });
-            document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-banner-sdk, #onetrust-consent-sdk, .ot-fade-in').forEach(el => el.remove());
+            if (document.body) {
+                document.body.style.overflow = 'auto';
+                document.body.classList.remove('ot-modal-open');
+            }
+            if (document.documentElement) {
+                document.documentElement.style.overflow = 'auto';
+            }
+            return res;
         }""")
+        if js_done:
+            clicked = True
     except Exception:
         pass
+    return clicked
 
 
-async def human_type_locator(page: Page, locator, text: str) -> None:
-    """Type text into a Playwright locator with human delays."""
-    await remove_cookie_banner(page)
+async def is_on_interests_screen(page) -> bool:
+    """Detects if page is currently on the onboarding interests selection screen."""
     try:
-        await locator.click(timeout=3000)
+        body_t = await page.locator("body").inner_text()
+        has_skip_text = any(x in body_t for x in ["تخطى وابدأ المشاهدة", "تخطي وابدأ المشاهدة", "ابدأ المشاهدة", "تخطي الخطوة"])
+        has_interests_text = any(x in body_t for x in ["عروض موسيقية", "مسلسلات أكشن", "أفلام أجنبية", "كوميديا", "جرائم", "مسلسلات خليجية"])
+        if has_skip_text or has_interests_text:
+            return True
+        if "/onboarding" in page.url or "/interests" in page.url:
+            return True
     except Exception:
-        await remove_cookie_banner(page)
-        await locator.click(force=True)
-    for char in text:
-        await page.keyboard.type(char)
-        await asyncio.sleep(random.uniform(0.04, 0.09))
+        pass
+    return False
 
 
-async def handle_skip_onboarding(page: Page) -> None:
-    """Detects and clicks 'تخطى وابدأ المشاهدة' or similar skip buttons if present."""
+async def handle_skip_onboarding(page) -> bool:
+    """Actively detects and clicks 'تخطى وابدأ المشاهدة' with resilient polling and verification until dismissed."""
     await remove_cookie_banner(page)
-    try:
+
+    for attempt in range(8):
+        await remove_cookie_banner(page)
+
+        # 1. If already on select profile screen, skip is done!
+        if await is_on_select_profile_screen(page):
+            print("[+] Already reached profile selection screen, skip not needed.", flush=True)
+            return True
+
+        if not await is_on_interests_screen(page) and attempt > 0:
+            print("[+] Interests screen dismissed successfully!", flush=True)
+            return True
+
+        print(f"[*] Attempt {attempt+1}/8 to click 'تخطى وابدأ المشاهدة'...", flush=True)
+
+        # Scroll to bottom so skip button is in viewport
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+
+        clicked = False
         skip_selectors = [
+            r"text=/تخط[ىي]\s*وابد[أا]\s*المشاهد/",
             "text='تخطى وابدأ المشاهدة'",
             "text='تخطي وابدأ المشاهدة'",
             "button:has-text('تخطى')",
@@ -745,257 +1088,657 @@ async def handle_skip_onboarding(page: Page) -> None:
             "a:has-text('تخطي')",
             "p:has-text('تخطى')",
             "span:has-text('تخطى')",
+            "text='تخطى'",
+            "text='تخطي'",
         ]
+
         for s in skip_selectors:
             try:
                 loc = page.locator(s).first
-                if await loc.is_visible(timeout=1500):
-                    await loc.click(force=True)
-                    print(f"[+] Skip clicked with selector: {s}", flush=True)
-                    await asyncio.sleep(2.5)
-                    return
+                if await loc.is_visible(timeout=500):
+                    await loc.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.2)
+                    await loc.click(timeout=2500)
+                    print(f"[+] Clicked skip button using locator: {s}", flush=True)
+                    clicked = True
+                    break
             except Exception:
                 pass
 
-        clicked = await page.evaluate("""() => {
-            const all = Array.from(document.querySelectorAll('button, a, div, span, p'));
-            const matches = all.filter(el => {
-                const t = (el.innerText || '').trim();
-                return t.includes('تخطى') || t.includes('تخطي') || t.includes('ابدأ المشاهدة');
-            });
-            if (matches.length > 0) {
-                matches.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
-                matches[0].click();
-                return matches[0].innerText;
-            }
-            return null;
-        }""")
-        if clicked:
-            print(f"[+] Skip clicked via JS evaluate: {clicked}", flush=True)
-            await asyncio.sleep(2.5)
-    except Exception as e:
-        print(f"[!] Skip note: {e}", flush=True)
+        if not clicked:
+            try:
+                loc = page.locator("text=/تخط[ىي]/").first
+                if await loc.is_visible(timeout=500):
+                    box = await loc.bounding_box()
+                    if box:
+                        await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                        print("[+] Clicked skip via mouse coordinates", flush=True)
+                        clicked = True
+            except Exception:
+                pass
 
-
-async def open_avatar_dropdown(page: Page) -> bool:
-    """Opens the user dropdown menu from the top-left header."""
-    await remove_cookie_banner(page)
-    opened = False
-    try:
-        opened = await page.evaluate("""() => {
-            const promo = Array.from(document.querySelectorAll('a, button, div')).find(el => {
-                const t = (el.innerText || '').trim();
-                return t === 'اشترك الآن' || t.includes('اشترك');
-            });
-            if (promo && promo.parentElement) {
-                const siblings = Array.from(promo.parentElement.children);
-                const avatar = siblings.find(el => el !== promo && (el.querySelector('img, svg') || el.tagName === 'DIV' || el.tagName === 'BUTTON'));
-                if (avatar) {
-                    avatar.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-                    avatar.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-                    avatar.click();
+        try:
+            js_clicked = await page.evaluate("""() => {
+                const all = Array.from(document.querySelectorAll('button, a, p, span, div'));
+                const el = all.find(e => {
+                    const t = (e.innerText || '').trim();
+                    return (t.includes('تخطى') || t.includes('تخطي')) && (t.includes('مشاهد') || t.includes('ابدأ') || t.includes('ابدا') || t.length < 25);
+                });
+                if (el) {
+                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    el.click();
+                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    let p = el.parentElement;
+                    for (let i = 0; i < 4 && p; i++) {
+                        p.click();
+                        p.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        p = p.parentElement;
+                    }
                     return true;
                 }
-            }
-            const headerImgs = Array.from(document.querySelectorAll('header img, nav img, div[id*="header"] img, img')).filter(img => {
-                const r = img.getBoundingClientRect();
-                return r.left >= 0 && r.left < 160 && r.top >= 0 && r.top < 120 && r.width > 15;
-            });
-            if (headerImgs.length > 0) {
-                const target = headerImgs[0].closest('button, a, div[class*="cursor"]') || headerImgs[0];
-                target.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-                target.click();
-                return true;
-            }
-            return false;
-        }""")
-    except Exception as e:
-        print(f"[!] open_avatar_dropdown JS note: {e}", flush=True)
-
-    # Mouse hover + click at (45, 58) as confirmed in live screen captures
-    try:
-        await page.mouse.move(45, 58)
-        await asyncio.sleep(0.3)
-        await page.mouse.click(45, 58)
-    except Exception:
-        pass
-
-    await asyncio.sleep(2.0)
-    return True
-
-
-async def click_change_profile_span(page: Page) -> bool:
-    """Clicks 'تغير الملف الشخصي' inside the open dropdown menu."""
-    selectors = [
-        "span.font-shahidMedium:has-text('تغير')",
-        "span:has-text('تغير الملف الشخصي')",
-        "span:has-text('تغيير الملف الشخصي')",
-        "text='تغير الملف الشخصي'",
-        "text='تغيير الملف الشخصي'",
-        ".underline:has-text('الملف الشخصي')",
-    ]
-    for s in selectors:
-        try:
-            loc = page.locator(s).first
-            if await loc.is_visible(timeout=2000):
-                await loc.click(force=True)
-                print(f"[+] Clicked switch profile using selector: {s}", flush=True)
-                return True
+                return false;
+            }""")
+            if js_clicked:
+                clicked = True
         except Exception:
             pass
 
-    # Direct JS search & click
+        # Fallback Strategy: If clicking 'تخطى' didn't dismiss after attempt 2, select categories & click 'متابعة'
+        if attempt >= 2 and await is_on_interests_screen(page):
+            try:
+                print("[*] Interests fallback: selecting categories and clicking 'متابعة'...", flush=True)
+                pills = [
+                    "text='أفلام أجنبية'",
+                    "text='مسلسلات خليجية'",
+                    "text='مسلسلات أكشن'",
+                    "text='كوميديا'",
+                    "text='جرائم'",
+                    "text='أنمي'",
+                ]
+                for p_sel in pills[:2]:
+                    try:
+                        p_loc = page.locator(p_sel).first
+                        if await p_loc.is_visible(timeout=400):
+                            await p_loc.click(force=True)
+                            await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
+
+                btn_follow = page.locator("button:has-text('متابعة')").first
+                if await btn_follow.is_visible(timeout=600) and not await btn_follow.is_disabled():
+                    await btn_follow.click(force=True)
+                    print("[+] Clicked 'متابعة' after selecting categories!", flush=True)
+            except Exception:
+                pass
+
+        for _ in range(6):
+            await asyncio.sleep(0.5)
+            if await is_on_select_profile_screen(page):
+                print("[+] Arrived on profile selection screen after skip!", flush=True)
+                return True
+            if not await is_on_interests_screen(page):
+                print("[+] Interests screen dismissed successfully!", flush=True)
+                return True
+
+        await asyncio.sleep(1.0)
+
+    return False
+
+# Alias so both names work identically
+handle_skip = handle_skip_onboarding
+
+
+async def is_on_select_profile_screen(page: Page) -> bool:
+    """Checks if we are currently on the 'اختر من يشاهد الآن' profile selection screen."""
     try:
-        clicked = await page.evaluate("""() => {
-            const all = Array.from(document.querySelectorAll('span, a, button, div, p'));
-            const target = all.find(el => {
-                const t = (el.innerText || '').trim();
-                return t === 'تغير الملف الشخصي' || t === 'تغيير الملف الشخصي' || (t.includes('تغير الملف') && t.length < 25);
-            });
-            if (target) {
-                target.click();
-                const p = target.closest('a, button') || target.parentElement;
-                if (p) p.click();
+        plus_sel = "[data-testid='SelectProfilePage_profile-plus-icon'], [data-test='plus'], img[alt='اضف ملف']"
+        if await page.locator(plus_sel).first.is_visible(timeout=300):
+            return True
+        body_t = await page.locator("body").inner_text()
+        if any(x in body_t for x in ["اختر من يشاهد", "من يشاهد؟", "Select Profile"]):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def open_avatar_dropdown(page: Page) -> bool:
+    """Waits patiently for the header avatar icon to appear and clicks it once to open the user menu."""
+    await remove_cookie_banner(page)
+
+    # 1. If already on select profile screen, there is NO header avatar here!
+    if await is_on_select_profile_screen(page):
+        print("[+] Already on profile selection screen, no header avatar exists here. Skipping avatar search!", flush=True)
+        return False
+
+    # 2. If "تغير الملف الشخصي" is already visible on screen, dropdown is already open
+    try:
+        already_open = await page.locator("[data-testid='selectedProfileDetails_change-profile'], text='تغير الملف الشخصي', text='تغيير الملف الشخصي'").first.is_visible(timeout=500)
+        if already_open:
+            print("[+] Dropdown already open!", flush=True)
+            return True
+    except Exception:
+        pass
+
+    avatar_selectors = [
+        "[data-testid='ShahidHeaderContainer_item-avatar-profile']",
+        "[data-testid='menuItemavatar']",
+        "div[data-testid='menuItemavatar'] div",
+        "header img[src*='avatar']",
+        "header img[src*='avatar-v3']",
+        "img[src*='avatar-v3']",
+        "header [class*='cursor-pointer']:has(img):not(#shahid-logo)",
+    ]
+
+    print("[*] Waiting for top avatar icon to appear...", flush=True)
+    avatar_loc = None
+    for sec in range(12):
+        await remove_cookie_banner(page)
+        # Check if profile selection screen appeared in the meantime
+        if await is_on_select_profile_screen(page):
+            print("[+] Profile selection screen appeared, skipping avatar search!", flush=True)
+            return False
+
+        for sel in avatar_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=400):
+                    avatar_loc = loc
+                    print(f"[+] Top avatar icon appeared using selector: {sel} (second {sec+1})", flush=True)
+                    break
+            except Exception:
+                pass
+        if avatar_loc:
+            break
+        await asyncio.sleep(1.0)
+
+    if not avatar_loc:
+        try:
+            js_found = await page.evaluate("""() => {
+                const el = document.querySelector('[data-testid="ShahidHeaderContainer_item-avatar-profile"]') ||
+                           document.querySelector('[data-testid="menuItemavatar"]') ||
+                           document.querySelector('header img[src*="avatar"]');
+                return !!el;
+            }""")
+            if js_found:
+                avatar_loc = page.locator("[data-testid='ShahidHeaderContainer_item-avatar-profile'], [data-testid='menuItemavatar']").first
+        except Exception:
+            pass
+
+    if not avatar_loc:
+        print("[!] Top avatar icon did not appear after wait.", flush=True)
+        return False
+
+    await asyncio.sleep(1.0)
+    print("[*] Clicking top avatar icon...", flush=True)
+    clicked = False
+    try:
+        await avatar_loc.click()
+        clicked = True
+    except Exception:
+        try:
+            await avatar_loc.click(force=True)
+            clicked = True
+        except Exception:
+            try:
+                clicked = await page.evaluate("""() => {
+                    const el = document.querySelector('[data-testid="ShahidHeaderContainer_item-avatar-profile"]') ||
+                               document.querySelector('[data-testid="menuItemavatar"]');
+                    if (el) { el.click(); return true; }
+                    return false;
+                }""")
+            except Exception as e:
+                print(f"[!] open_avatar_dropdown JS error: {e}", flush=True)
+
+    await asyncio.sleep(1.0)
+    return clicked
+
+
+async def click_change_profile_span(page: Page) -> bool:
+    """Waits patiently for 'تغير الملف الشخصي' to appear in the dropdown menu and clicks it cleanly.
+    Clicks the exact underlined text span, never clicks 'تعديل المعلومات الشخصية' or other menu options."""
+    print("[*] Waiting for 'تغير الملف الشخصي' to appear in dropdown...", flush=True)
+
+    selectors = [
+        "[data-testid='selectedProfileDetails_change-profile'] span.underline",
+        "[data-testid='selectedProfileDetails_change-profile'] span:has-text('تغير')",
+        "span.font-shahidMedium.underline",
+        "span.underline:has-text('تغير')",
+        "span:text-is('تغير الملف الشخصي')",
+        "span:text-is('تغيير الملف الشخصي')",
+        "span:has-text('تغير الملف الشخصي')",
+    ]
+
+    target_loc = None
+    # Wait patiently for up to 15 seconds without closing/re-toggling the menu
+    for attempt in range(15):
+        for s in selectors:
+            try:
+                loc = page.locator(s).first
+                if await loc.is_visible(timeout=500):
+                    txt = (await loc.inner_text() or '').strip()
+                    if ('تغير' in txt or 'تغيير' in txt) and 'تعديل' not in txt and 'معلومات' not in txt:
+                        target_loc = loc
+                        print(f"[+] 'تغير الملف الشخصي' appeared using selector: {s} (second {attempt+1})", flush=True)
+                        break
+            except Exception:
+                pass
+        if target_loc:
+            break
+
+        try:
+            found = await page.evaluate("""() => {
+                const span = document.querySelector('[data-testid=\"selectedProfileDetails_change-profile\"] span.underline') ||
+                             document.querySelector('[data-testid=\"selectedProfileDetails_change-profile\"] span:last-child') ||
+                             Array.from(document.querySelectorAll('span')).find(s => {
+                                 const t = (s.innerText || '').trim();
+                                 return (t === 'تغير الملف الشخصي' || t === 'تغيير الملف الشخصي') && !t.includes('تعديل');
+                             });
+                return !!span;
+            }""")
+            if found:
+                target_loc = page.locator("[data-testid='selectedProfileDetails_change-profile'] span.underline, span:has-text('تغير الملف الشخصي')").first
+                break
+        except Exception:
+            pass
+
+        await asyncio.sleep(1.0)
+
+    if not target_loc:
+        print("[!] 'تغير الملف الشخصي' did not appear within 15 seconds.", flush=True)
+        return False
+
+    # Wait 1.0 second after appearance
+    await asyncio.sleep(1.0)
+
+    print("[*] Clicking 'تغير الملف الشخصي'...", flush=True)
+    clicked = False
+    try:
+        await target_loc.click()
+        clicked = True
+    except Exception:
+        try:
+            await target_loc.click(force=True)
+            clicked = True
+        except Exception:
+            pass
+
+    try:
+        js_clicked = await page.evaluate("""() => {
+            const span = document.querySelector('[data-testid=\"selectedProfileDetails_change-profile\"] span.underline') ||
+                         document.querySelector('[data-testid=\"selectedProfileDetails_change-profile\"] span:last-child') ||
+                         Array.from(document.querySelectorAll('span')).find(s => {
+                             const t = (s.innerText || '').trim();
+                             return (t === 'تغير الملف الشخصي' || t === 'تغيير الملف الشخصي') && !t.includes('تعديل');
+                         });
+            if (span) {
+                span.click();
+                span.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                const parent = span.closest('[data-testid=\"selectedProfileDetails_change-profile\"]');
+                if (parent) {
+                    parent.click();
+                    parent.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                }
                 return true;
             }
             return false;
         }""")
-        if clicked:
-            print("[+] Clicked 'تغير الملف الشخصي' via JS evaluate!", flush=True)
-            return True
+        if js_clicked:
+            clicked = True
     except Exception as e:
-        print(f"[!] click_change_profile_span JS note: {e}", flush=True)
+        print(f"[!] click_change_profile_span JS error: {e}", flush=True)
 
-    # Coordinate fallback at (138, 240)
-    try:
-        print("[*] Coordinate fallback for 'تغير الملف الشخصي' at (138, 240)...", flush=True)
-        await page.mouse.click(138, 240)
-        return True
-    except Exception:
-        pass
-
-    return False
+    await asyncio.sleep(2.0)
+    return clicked
 
 
 async def navigate_to_select_profile_screen(page: Page) -> bool:
-    """Ensures page is on profile selection screen ('اختر من يشاهد')."""
+    """Navigates to the profile selection screen ONLY via the user's required UI flow:
+    1. Wait for top avatar -> click it.
+    2. Wait for 'تغير الملف الشخصي' -> click it.
+    3. Wait for profile selection screen / plus icon.
+    No direct URL navigation fallback."""
     await remove_cookie_banner(page)
 
-    # Check if already on the profile selection screen
-    plus_btn = page.locator(
-        "[data-testid='SelectProfilePage_profile-plus-icon'], [data-test='plus'], img[alt='اضف ملف']"
-    ).first
-    try:
-        if await plus_btn.is_visible(timeout=2000):
+    # 1. Check if ALREADY on profile selection screen (poll for up to 8s)
+    # If still on interests screen, dismiss it first!
+    if await is_on_interests_screen(page):
+        print("[*] Detected interests screen inside profile switcher! Dismissing it now...", flush=True)
+        await handle_skip_onboarding(page)
+        await asyncio.sleep(1.5)
+
+    print("[*] Checking if already on profile selection screen...", flush=True)
+    for _ in range(8):
+        if await is_on_select_profile_screen(page):
             print("[+] Already on profile selection screen!", flush=True)
             return True
-    except Exception:
-        pass
+        await asyncio.sleep(0.8)
 
-    # Open header avatar dropdown
-    print("[*] Opening profile menu from header...", flush=True)
-    await open_avatar_dropdown(page)
+    # If accidentally on /hub/profile, return to home first
+    if "/hub/profile" in page.url:
+        print("[!] Detected on /hub/profile! Returning to home...", flush=True)
+        await page.goto("https://shahid.mbc.net/ar/home", wait_until="domcontentloaded")
+        await asyncio.sleep(2.5)
 
-    # Click "تغير الملف الشخصي"
-    print("[*] Clicking 'تغير الملف الشخصي'...", flush=True)
-    await click_change_profile_span(page)
-    await asyncio.sleep(3.0)
+    # 2. Strict UI flow retry loop (Avatar -> تغير الملف الشخصي -> Wait for plus icon)
+    for attempt in range(3):
+        print(f"[*] Navigating to profiles screen via avatar menu (attempt {attempt+1}/3)...", flush=True)
+        await remove_cookie_banner(page)
 
-    # Verify arrival on profile selection screen
-    try:
-        if await plus_btn.is_visible(timeout=5000):
-            print("[+] Successfully reached profile selection screen!", flush=True)
+        if await is_on_select_profile_screen(page):
+            print("[+] Arrived on profile screen!", flush=True)
             return True
-    except Exception:
-        pass
 
+        if "/hub/profile" in page.url:
+            print("[!] On /hub/profile, returning to home...", flush=True)
+            await page.goto("https://shahid.mbc.net/ar/home", wait_until="domcontentloaded")
+            await asyncio.sleep(2.5)
+
+        avatar_opened = await open_avatar_dropdown(page)
+        if await is_on_select_profile_screen(page):
+            print("[+] Arrived on profile screen!", flush=True)
+            return True
+
+        if not avatar_opened:
+            print(f"[*] Retrying open avatar dropdown...", flush=True)
+            await asyncio.sleep(2.0)
+            continue
+
+        clicked = await click_change_profile_span(page)
+        if not clicked:
+            print(f"[*] 'تغير الملف الشخصي' click retry...", flush=True)
+            await asyncio.sleep(2.0)
+            continue
+
+        # Wait up to 12s for profile selection screen to appear
+        print("[*] Waiting for profile selection screen to load after click...", flush=True)
+        for _ in range(12):
+            if await is_on_select_profile_screen(page):
+                print("[+] Arrived on profile screen via menu!", flush=True)
+                return True
+
+            if "/hub/profile" in page.url:
+                print("[!] Accidental navigation to /hub/profile detected! Returning to home...", flush=True)
+                await page.goto("https://shahid.mbc.net/ar/home", wait_until="domcontentloaded")
+                await asyncio.sleep(2.5)
+                break
+
+            await asyncio.sleep(1.0)
+
+    print(f"[*] URL at profile screen: {page.url}", flush=True)
     return False
 
 
 async def click_add_profile(page: Page) -> bool:
-    """Clicks '+' / 'إضافة' to open the new profile modal."""
-    print("[*] Clicking '+' / 'إضافة'...", flush=True)
-    selectors = [
+    """Clicks '+' / 'إضافة' to open the new profile modal with active polling and verification."""
+    print("[*] Clicking '+' / 'إضافة' to open modal...", flush=True)
+    await remove_cookie_banner(page)
+
+    # 1. Check if modal is ALREADY open
+    modal_input = page.locator("input#profileName, input[placeholder*='الاسم'], input[placeholder*='اسم'], input[placeholder*='ادخل'], form input[type='text']:visible").first
+    try:
+        if await modal_input.is_visible(timeout=600):
+            print("[+] Add profile modal is already open!", flush=True)
+            return True
+    except Exception:
+        pass
+
+    # Locators for plus icon / circle / text
+    plus_targets = [
+        "[data-testid='SelectProfilePage_profile-plus-icon'] .rounded-full",
+        "[data-testid='SelectProfilePage_profile-plus-icon'] img[alt='اضف ملف']",
+        "[data-testid='SelectProfilePage_profile-plus-icon'] img",
         "[data-testid='SelectProfilePage_profile-plus-icon']",
         "[data-test='plus']",
         "img[alt='اضف ملف']",
-        "div:has(> img[alt='اضف ملف'])",
-        "div:has(> p:text('إضافة'))",
-        "p:text('إضافة')",
-        "text='إضافة'",
+        "p:text-is('إضافة')",
     ]
-    for s in selectors:
+
+    for attempt in range(8):
+        print(f"[*] Attempt {attempt+1}/8 to click '+' / 'إضافة'...", flush=True)
+        await remove_cookie_banner(page)
+
+        # Check if modal opened in the meantime
         try:
-            loc = page.locator(s).first
-            if await loc.is_visible(timeout=2000):
-                await loc.click(force=True)
-                print(f"[+] Clicked '+' using selector: {s}", flush=True)
+            if await modal_input.is_visible(timeout=400):
+                print("[+] Add profile modal is open!", flush=True)
                 return True
         except Exception:
             pass
 
-    try:
-        clicked = await page.evaluate("""() => {
-            const plus = document.querySelector('[data-testid="SelectProfilePage_profile-plus-icon"]') ||
-                         document.querySelector('[data-test="plus"]') ||
-                         document.querySelector('img[alt="اضف ملف"]');
-            if (plus) {
-                plus.click();
-                const p = plus.closest('div.cursor-pointer') || plus.parentElement;
-                if (p) p.click();
-                return true;
-            }
-            const p = Array.from(document.querySelectorAll('p, span, div')).find(el => (el.innerText || '').trim() === 'إضافة');
-            if (p) {
-                p.click();
-                const parent = p.closest('[class*="cursor-pointer"]') || p.parentElement;
-                if (parent) parent.click();
-                return true;
-            }
-            return false;
-        }""")
-        if clicked:
-            print("[+] Clicked '+' via JS evaluate!", flush=True)
-            return True
-    except Exception as e:
-        print(f"[!] click_add_profile JS error: {e}", flush=True)
+        # Strategy A: Real Playwright click on the first visible plus element
+        clicked = False
+        for sel in plus_targets:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=600):
+                    await loc.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.2)
+                    await loc.click(timeout=2500)
+                    print(f"[+] Clicked '+' using locator: {sel}", flush=True)
+                    clicked = True
+                    break
+            except Exception:
+                pass
 
-    # Coordinate fallback on profile selection screen (400, 410)
-    try:
-        print("[*] Fallback mouse click on '+' at (400, 410)...", flush=True)
-        await page.mouse.click(400, 410)
-        return True
-    except Exception:
-        pass
+        # Strategy B: Click using mouse coordinates at center of circular plus icon
+        if not clicked:
+            try:
+                loc = page.locator("[data-testid='SelectProfilePage_profile-plus-icon']").first
+                if await loc.is_visible(timeout=500):
+                    box = await loc.bounding_box()
+                    if box:
+                        cx = box['x'] + box['width'] / 2
+                        cy = box['y'] + (box['height'] * 0.35)
+                        await page.mouse.click(cx, cy)
+                        print(f"[+] Clicked '+' via mouse coordinates: ({cx}, {cy})", flush=True)
+                        clicked = True
+            except Exception:
+                pass
 
+        # Strategy C: Dispatch bubbling events in JavaScript directly on the plus circle
+        if not clicked:
+            try:
+                clicked = await page.evaluate("""() => {
+                    const plus = document.querySelector('[data-testid="SelectProfilePage_profile-plus-icon"]') ||
+                                 document.querySelector('img[alt="اضف ملف"]') ||
+                                 document.querySelector('[data-test="plus"]');
+                    if (plus) {
+                        const circle = plus.querySelector('.rounded-full') || plus.querySelector('img') || plus;
+                        circle.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                        circle.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                        circle.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        circle.click();
+                        return true;
+                    }
+                    return false;
+                }""")
+            except Exception:
+                pass
+
+        # Check if modal opened (wait up to 3 seconds)
+        for _ in range(6):
+            await asyncio.sleep(0.5)
+            try:
+                if await modal_input.is_visible(timeout=500):
+                    print("[+] Add profile modal successfully opened (input field visible)!", flush=True)
+                    return True
+                body_t = await page.locator("body").inner_text()
+                if any(k in body_t for k in ["ادخل الاسم", "اضافة ملف", "أضف ملف"]):
+                    print("[+] Add profile modal detected via text!", flush=True)
+                    return True
+            except Exception:
+                pass
+
+        await asyncio.sleep(1.0)
+
+    print("[!] Failed to open add profile modal after 8 attempts.", flush=True)
     return False
 
 
-async def create_single_profile(page: Page, profile_name: str) -> None:
+async def fill_profile_name(page, profile_name: str, target_locator=None) -> bool:
+    """Robustly types and verifies the profile name in the input field, clearing any 'هذه الخانة مطلوبة' error."""
+    await remove_cookie_banner(page)
+    input_box = target_locator
+    if not input_box:
+        selectors = [
+            "input[placeholder*='الاسم']",
+            "input[placeholder*='اسم']",
+            "input[placeholder*='ادخل']",
+            "input#profileName",
+            "form input[type='text']:visible",
+            "input[type='text']:visible",
+        ]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=1500):
+                    input_box = loc
+                    break
+            except Exception:
+                pass
+
+    if not input_box:
+        print("[!] Profile name input not found!", flush=True)
+        return False
+
+    try:
+        await input_box.scroll_into_view_if_needed()
+        await input_box.click(timeout=2500)
+    except Exception:
+        try:
+            await input_box.click(force=True)
+        except Exception:
+            pass
+
+    await asyncio.sleep(0.2)
+    try:
+        await input_box.press("Control+A")
+        await input_box.press("Backspace")
+    except Exception:
+        pass
+    await asyncio.sleep(0.2)
+
+    # 1. Type with sequential keyboard events
+    try:
+        await input_box.press_sequentially(profile_name, delay=random.randint(30, 60))
+    except Exception:
+        for c in profile_name:
+            await page.keyboard.type(c)
+            await asyncio.sleep(0.04)
+
+    await asyncio.sleep(0.3)
+
+    # 2. Check and fill fallback
+    try:
+        val = await input_box.input_value()
+        if val != profile_name:
+            await input_box.fill(profile_name)
+    except Exception:
+        try:
+            await input_box.fill(profile_name)
+        except Exception:
+            pass
+
+    # 3. Native React input setter and event dispatch directly on input_box to ensure state sync and clear 'هذه الخانة مطلوبة'
+    try:
+        await input_box.evaluate("""(el, val) => {
+            el.focus();
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+            if (setter) {
+                setter.call(el, val);
+            } else {
+                el.value = val;
+            }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: val }));
+        }""", profile_name)
+    except Exception:
+        try:
+            await page.evaluate("""(val) => {
+                const el = document.querySelector("input[placeholder*='الاسم'], input[placeholder*='ادخل'], input#profileName, form input[type='text']:visible, input[type='text']:visible");
+                if (el) {
+                    el.focus();
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                    if (setter) setter.call(el, val); else el.value = val;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: val }));
+                }
+            }""", profile_name)
+        except Exception:
+            pass
+
+    # 4. Trigger typing keys to finalize React form validation
+    try:
+        await input_box.press("End")
+        await input_box.press("Space")
+        await asyncio.sleep(0.05)
+        await input_box.press("Backspace")
+    except Exception:
+        pass
+
+    await asyncio.sleep(0.5)
+    print(f"[+] Successfully filled profile name: '{profile_name}'", flush=True)
+    return True
+
+
+async def human_type_locator(page, locator, text: str) -> bool:
+    """Wrapper for fill_profile_name to safely type into locator with React event handling."""
+    return await fill_profile_name(page, text, target_locator=locator)
+
+
+async def create_single_profile(page: Page, profile_name: str) -> bool:
     """Full lifecycle to add a new profile: navigate to screen -> click '+' -> type name -> click 'انشاء' -> skip onboarding."""
     print(f"\n==========================================", flush=True)
     print(f"[*] Starting creation for: {profile_name}", flush=True)
     print(f"==========================================", flush=True)
 
-    # 1. Skip onboarding / interests if present from previous step
-    await handle_skip_onboarding(page)
+    # 1. Skip onboarding / interests ONLY if not already on profile selection screen
+    if not await is_on_select_profile_screen(page):
+        await handle_skip_onboarding(page)
 
-    # 2. Ensure we are on profile selection screen ('اختر من يشاهد')
-    await navigate_to_select_profile_screen(page)
-    await asyncio.sleep(2.0)
+    # 2. Ensure we are on profile selection screen ('اختر من يشاهد') with retry
+    on_screen = False
+    for attempt in range(3):
+        if await navigate_to_select_profile_screen(page):
+            on_screen = True
+            break
+        print(f"[*] Retry reaching profile screen (attempt {attempt+1}/3)...", flush=True)
+        await asyncio.sleep(2.0)
 
-    # 3. Click "+" / "إضافة"
-    await click_add_profile(page)
-    await asyncio.sleep(2.5)
+    if not on_screen:
+        print(f"[!] Could not reach profile screen for {profile_name}, aborting single profile attempt.", flush=True)
+        return False
+
+    await asyncio.sleep(1.5)
+
+    # 3. Click "+" / "إضافة" to open modal
+    opened_modal = False
+    for attempt in range(3):
+        if await click_add_profile(page):
+            opened_modal = True
+            break
+        print(f"[*] Retrying click on '+' (attempt {attempt+1}/3)...", flush=True)
+        await asyncio.sleep(1.5)
+
+    if not opened_modal:
+        print(f"[!] Could not open profile modal for {profile_name}", flush=True)
+        return False
+
+    await asyncio.sleep(1.0)
 
     # 4. Enter profile name in modal
     print(f"[*] Typing '{profile_name}' into modal...", flush=True)
     name_locators = [
         "input[placeholder*='الاسم']",
         "input[placeholder*='اسم']",
+        "input#profileName",
         "form input[type='text']:visible",
         "input[type='text']:visible",
-        "input:not([type='hidden']):visible",
     ]
     name_box = None
     for sel in name_locators:
@@ -1008,8 +1751,12 @@ async def create_single_profile(page: Page, profile_name: str) -> None:
             pass
 
     if not name_box:
-        name_box = page.locator("input[type='text']:visible, form input:visible").first
-        await name_box.wait_for(state="visible", timeout=8000)
+        try:
+            name_box = page.locator("input[type='text']:visible, form input:visible").first
+            await name_box.wait_for(state="visible", timeout=6000)
+        except Exception as e:
+            print(f"[!] Name input not visible: {e}", flush=True)
+            return False
 
     await name_box.click()
     await page.keyboard.press("Control+A")
@@ -1026,24 +1773,28 @@ async def create_single_profile(page: Page, profile_name: str) -> None:
         "button[type='submit']",
     ]
     created = False
-    for s in btn_selectors:
-        try:
-            loc = page.locator(s).last
-            if await loc.is_visible(timeout=2000):
-                await loc.click(force=True)
-                print(f"[+] Clicked 'انشاء' using selector: {s}", flush=True)
-                created = True
-                break
-        except Exception:
-            pass
+    for attempt in range(8):
+        for s in btn_selectors:
+            try:
+                loc = page.locator(s).last
+                if await loc.is_visible(timeout=1000) and not await loc.is_disabled():
+                    print(f"[*] 'انشاء' button is enabled. Waiting 3 seconds before clicking per user instruction...", flush=True)
+                    await asyncio.sleep(3.0)
+                    await loc.click(force=True)
+                    print(f"[+] Clicked 'انشاء' using selector: {s}", flush=True)
+                    created = True
+                    break
+            except Exception:
+                pass
+        if created:
+            break
 
-    if not created:
         try:
             created = await page.evaluate("""() => {
                 const btns = Array.from(document.querySelectorAll('button'));
                 const b = btns.find(el => {
                     const t = (el.innerText || '').trim();
-                    return t === 'انشاء' || t === 'إنشاء';
+                    return (t === 'انشاء' || t === 'إنشاء') && !el.disabled;
                 });
                 if (b) {
                     b.click();
@@ -1053,44 +1804,72 @@ async def create_single_profile(page: Page, profile_name: str) -> None:
             }""")
         except Exception:
             pass
+        if created:
+            break
+
+        await asyncio.sleep(0.8)
 
     if not created:
-        print("[*] Coordinate fallback for 'انشاء' at (640, 710)...", flush=True)
-        await page.mouse.click(640, 710)
+        print(f"[!] Warning: 'انشاء' button not confirmed for {profile_name}", flush=True)
 
     await asyncio.sleep(4.0)
 
     # 6. Skip onboarding / interests if shown after profile creation
     await handle_skip_onboarding(page)
-    await asyncio.sleep(2.0)
-    print(f"[+] Profile {profile_name} created successfully!\n", flush=True)
+    await asyncio.sleep(1.5)
+    print(f"[+] Profile {profile_name} creation cycle finished.\n", flush=True)
+    return True
 
 
-async def automate_all_profiles(page: Page, status_msg, base_name: str = "dahoom") -> None:
-    """Automates creation of dahoom1, dahoom2, dahoom3, and dahoom4."""
+async def automate_all_profiles(page: Page, status_msg, base_name: str = "dahoom", custom_names: Optional[List[str]] = None) -> List[str]:
+    """Automates creation of 4 profiles using custom_names or base_name + 1..4."""
     print("[*] Starting automated profile onboarding and creation...", flush=True)
 
-    # Step 1: First Profile (dahoom1) on onboarding screen
+    if custom_names and len(custom_names) >= 4:
+        names_to_create = [str(n).strip() for n in custom_names[:4]]
+    else:
+        names_to_create = [f"{base_name}1", f"{base_name}2", f"{base_name}3", f"{base_name}4"]
+
+    p1 = names_to_create[0]
+
+    # Step 1: First Profile on onboarding screen
     try:
         await remove_cookie_banner(page)
-        name_input = page.locator("input#profileName, input[placeholder*='اسم الملف'], input[type='text']:visible").first
+        name_input = page.locator("input#profileName, input[placeholder*='اسم الملف'], input[placeholder*='الاسم'], input[type='text']:visible").first
         await name_input.wait_for(state="visible", timeout=12000)
-        await human_type_locator(page, name_input, f"{base_name}1")
-        await asyncio.sleep(1.0)
-
+        await human_type_locator(page, name_input, p1)
         next_btn = page.locator("button:has-text('متابعة'), button[type='submit']").first
+        for _ in range(8):
+            if await next_btn.is_visible() and not await next_btn.is_disabled():
+                break
+            await asyncio.sleep(0.5)
+
+        print(f"[*] Profile 1 button is enabled. Waiting 2 seconds before clicking 'متابعة'...", flush=True)
+        await asyncio.sleep(2.0)
         await next_btn.click()
-        await asyncio.sleep(3.0)
+        # Resilient wait for Profile 1 transition with retry on network lag
+        for s in range(12):
+            await asyncio.sleep(1.0)
+            await remove_cookie_banner(page)
+            if not await page.locator("input#profileName").is_visible():
+                break
+            if s % 3 == 0:
+                try:
+                    if await next_btn.is_visible() and not await next_btn.is_disabled():
+                        print(f"[*] Retrying Profile 1 'متابعة' click due to network lag...", flush=True)
+                        await next_btn.click()
+                except Exception:
+                    pass
+        await asyncio.sleep(2.0)
     except Exception as e:
-        print(f"[!] dahoom1 initial step note: {e}", flush=True)
+        print(f"[!] {p1} initial step note: {e}", flush=True)
 
     # Skip interests if shown
     await handle_skip_onboarding(page)
     await asyncio.sleep(2.0)
 
-    # Step 2: Loop for dahoom2, dahoom3, dahoom4
-    for i in range(2, 5):
-        prof = f"{base_name}{i}"
+    # Step 2: Loop for profiles 2, 3, 4
+    for prof in names_to_create[1:]:
         try:
             await status_msg.edit_text(f"⏳ جاري إنشاء الملف الشخصي ({prof})...")
         except Exception:
@@ -1102,18 +1881,31 @@ async def automate_all_profiles(page: Page, status_msg, base_name: str = "dahoom
             print(f"[!] Error creating profile {prof}: {err}", flush=True)
             await handle_skip_onboarding(page)
 
+    return names_to_create
+
 
 async def human_type(page: Page, selector: str, text: str) -> None:
-    """Type characters with random human-like intervals to evade heuristic detection."""
+    """Type characters safely into input field with human intervals and focus verification."""
     await remove_cookie_banner(page)
+    loc = page.locator(selector)
     try:
-        await page.locator(selector).click(timeout=3000)
+        await loc.click(timeout=3000)
     except Exception:
         await remove_cookie_banner(page)
-        await page.locator(selector).click(force=True)
-    for char in text:
-        await page.keyboard.type(char)
-        await asyncio.sleep(random.uniform(0.03, 0.09))
+        await loc.click(force=True)
+    try:
+        await loc.press_sequentially(text, delay=random.randint(25, 50))
+    except Exception:
+        for char in text:
+            await page.keyboard.type(char)
+            await asyncio.sleep(random.uniform(0.03, 0.08))
+    # Verify input value is 100% complete
+    try:
+        val = await loc.input_value()
+        if val != text:
+            await loc.fill(text)
+    except Exception:
+        pass
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1131,7 +1923,10 @@ async def start_registration_entry(update: Update, context: ContextTypes.DEFAULT
     """Entry point for the account registration flow."""
     await cleanup_session(context, force=True)
     user_id = update.effective_user.id
-    context.user_data["session"] = RegistrationSession()
+    session = RegistrationSession()
+    session.user_id = user_id
+    context.user_data["session"] = session
+    context.user_data["user_id"] = user_id
     context.user_data["batch_info"] = None
 
     queue = get_user_queued_emails(user_id)
@@ -1356,6 +2151,7 @@ async def start_batch_next_account(msg_target, context: ContextTypes.DEFAULT_TYP
     base = batch_info["base_name"]
 
     session = RegistrationSession()
+    session.user_id = batch_info.get("user_id", 0)
     context.user_data["session"] = session
     session.email = current_email
     session.password = pwd
@@ -1426,6 +2222,18 @@ async def email_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         perm_pwd = user_settings["perm_password"]
         session.password = perm_pwd
 
+        if not user_settings.get("create_profiles_enabled", True):
+            session.skip_profiles = True
+            await update.message.reply_text(
+                f"✅ تم حفظ البريد: `{val}`\n"
+                f"🔐 **تم تطبيق كلمة المرور الدائمة:** `{perm_pwd}`\n\n"
+                "ℹ️ **تنبيه:** ميزة تجهيز الملفات (معطّلة حالياً).\n"
+                "سيتوقف البوت تلقائياً فور اكتمال إنشاء الحساب دون إعداد أي ملفات.\n\n"
+                "🚀 جاري الانطلاق مباشرة لطلب كود التحقق...",
+                parse_mode="Markdown"
+            )
+            return await launch_browser_and_request_otp(update.message, session, "account", context)
+
         if has_perm_name:
             perm_name = user_settings["perm_name"]
             session.base_name = perm_name
@@ -1441,10 +2249,10 @@ async def email_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(
             f"✅ تم حفظ البريد: `{val}`\n"
             f"🔐 **تم تطبيق كلمة المرور الدائمة تلقائياً:** `{perm_pwd}`\n\n"
-            "👤 **أدخل الآن الاسم الذي تريده للملفات الشخصية:**\n"
-            "*(مثال: إذا أدخلت `dahoom` ستكون الملفات `dahoom1`, `dahoom2`...)*\n"
-            "*(أو إذا أدخلت `noor` ستكون الملفات `noor1`, `noor2`...)*\n\n"
-            "💡 أو اضغط على الزر أدناه لاعتماد الاسم الافتراضي (`dahoom`):",
+            "👤 **أدخل الآن أسماء الملفات الشخصية (4 ملفات):**\n\n"
+            "🔹 **الخيار 1 (اسم أساسي تلقائي):** أرسل اسماً واحداً مثل `dahoom` لترقيمه تلقائياً (`dahoom1` إلى `dahoom4`).\n"
+            "🔹 **الخيار 2 (4 أسماء مخصصة بنفسك):** أرسل 4 أسماء مفصولة بسطر جديد أو فاصلة (،) وسيتم تسميتها بالضبط بالترتيب بدون أي تغيير أو زيادة!\n\n"
+            "💡 أو اختر من الأزرار بالأسفل:",
             reply_markup=get_name_keyboard(),
             parse_mode="Markdown"
         )
@@ -1474,6 +2282,17 @@ async def password_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     session.password = val
 
     user_settings = get_user_settings(update.effective_user.id)
+    if not user_settings.get("create_profiles_enabled", True):
+        session.skip_profiles = True
+        await update.message.reply_text(
+            "✅ **تم حفظ كلمة المرور بنجاح.**\n\n"
+            "ℹ️ **تنبيه:** ميزة تجهيز الملفات (معطّلة حالياً).\n"
+            "سيتوقف البوت تلقائياً فور اكتمال إنشاء الحساب دون إعداد أي ملفات.\n\n"
+            "🚀 جاري الانطلاق مباشرة لطلب كود التحقق...",
+            parse_mode="Markdown"
+        )
+        return await launch_browser_and_request_otp(update.message, session, "account", context)
+
     has_perm_name = user_settings.get("perm_name_enabled") and user_settings.get("perm_name")
 
     if has_perm_name:
@@ -1489,14 +2308,29 @@ async def password_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     await update.message.reply_text(
         "✅ **تم حفظ كلمة المرور بنجاح.**\n\n"
-        "👤 **أدخل الآن الاسم الذي تريده للملفات الشخصية:**\n"
-        "*(مثال: إذا أدخلت `dahoom` ستكون الملفات `dahoom1` و `dahoom2` و `dahoom3` و `dahoom4`)*\n"
-        "*(أو إذا أدخلت `noor` ستكون الملفات `noor1` و `noor2` و `noor3` و `noor4`)*\n\n"
-        "💡 أو اضغط على الزر أدناه لاعتماد الاسم الافتراضي (`dahoom`):",
+        "👤 **أدخل الآن أسماء الملفات الشخصية (4 ملفات):**\n\n"
+        "🔹 **الخيار 1 (اسم أساسي تلقائي):** أرسل اسماً واحداً مثل `dahoom` لترقيمه تلقائياً (`dahoom1` إلى `dahoom4`).\n"
+        "🔹 **الخيار 2 (4 أسماء مخصصة بنفسك):** أرسل 4 أسماء مفصولة بسطر جديد أو فاصلة (،) وسيتم تسميتها بالضبط بالترتيب بدون أي تغيير أو زيادة!\n\n"
+        "💡 أو اختر من الأزرار بالأسفل:",
         reply_markup=get_name_keyboard(),
         parse_mode="Markdown"
     )
     return BASE_NAME
+
+
+async def safe_edit_message(msg, text: str, **kwargs):
+    """Edit message text safely, falling back to plain text if Markdown parsing fails."""
+    try:
+        return await msg.edit_text(text, **kwargs)
+    except Exception as exc:
+        if "parse" in str(exc).lower() and "parse_mode" in kwargs:
+            kwargs.pop("parse_mode", None)
+            try:
+                return await msg.edit_text(text, **kwargs)
+            except Exception:
+                pass
+        logger.error(f"[!] safe_edit_message error: {exc}")
+        return None
 
 
 async def launch_browser_and_request_otp(msg_target, session: RegistrationSession, base: str, context: ContextTypes.DEFAULT_TYPE = None) -> int:
@@ -1506,13 +2340,55 @@ async def launch_browser_and_request_otp(msg_target, session: RegistrationSessio
         bi = context.user_data["batch_info"]
         c_num = bi.get("current_index", 0) + 1
         b_tot = bi.get("total", 0)
-        batch_prefix = f"🔄 **[الإنشاء التلقائي: حساب {c_num} من {b_tot}]**\n\n"
+        batch_prefix = f"🔄 **الإنشاء التلقائي: حساب {c_num} من {b_tot}**\n\n"
         batch_hint = "💡 فور إدخال الرمز، سينتهي إعداد هذا الحساب وينتقل البوت تلقائياً للإيميل التالي!"
+
+    custom_names = getattr(session, "custom_names", None)
+    skip_profiles = getattr(session, "skip_profiles", False)
+
+    if skip_profiles:
+        msg_names = "ℹ️ **نمط الإنشاء:** إنشاء حساب فقط (بدون إعداد ملفات شخصية).\n\n"
+    elif custom_names and len(custom_names) == 4:
+        names_str = ", ".join(f"`{n}`" for n in custom_names)
+        msg_names = f"✅ **تم اعتماد أسماء الملفات الـ 4 المخصصة:** {names_str}\n\n"
+    else:
+        msg_names = f"✅ **تم اعتماد اسم الملفات:** `{base}1`, `{base}2`, `{base}3`, `{base}4`\n\n"
+
+    # Determine user_id to get rotating proxy from pool
+    u_id = getattr(session, "user_id", 0)
+    if not u_id:
+        if context and context.user_data.get("user_id"):
+            u_id = context.user_data["user_id"]
+        elif hasattr(msg_target, "chat_id"):
+            u_id = msg_target.chat_id
+        elif hasattr(msg_target, "from_user") and msg_target.from_user:
+            u_id = msg_target.from_user.id
+
+    proxy_config = get_next_proxy_for_user(u_id)
+    session.proxy_config = proxy_config
+
+    proxy_display = ""
+    proxy_playwright = None
+    if proxy_config:
+        proxy_playwright = {
+            "server": proxy_config["server"],
+        }
+        if proxy_config.get("username"):
+            proxy_playwright["username"] = proxy_config["username"]
+            proxy_playwright["password"] = proxy_config.get("password", "")
+
+        host_disp = proxy_config.get("host") or proxy_config["server"].replace("http://", "").replace("https://", "")
+        idx_disp = proxy_config.get("proxy_index", 1)
+        tot_disp = proxy_config.get("total_proxies", 1)
+        proxy_display = f"🌐 **البروكسي المستخدم:** `{host_disp}` (#{idx_disp} من {tot_disp})\n\n"
+        logger.info(f"Rotating Proxy picked: {host_disp} (#{idx_disp}/{tot_disp}) for user {u_id}")
 
     status_msg = await msg_target.reply_text(
         batch_prefix +
-        f"✅ **تم اعتماد اسم الملفات:** `{base}1`, `{base}2`, `{base}3`, `{base}4`\n\n"
+        proxy_display +
+        msg_names +
         "⚡ جاري التواصل مع Shahid وطلب كود التحقق... انتظر لحظات.",
+        reply_markup=get_cancel_keyboard(),
         parse_mode="Markdown"
     )
 
@@ -1547,30 +2423,33 @@ async def launch_browser_and_request_otp(msg_target, session: RegistrationSessio
         if not is_headless:
             chromium_args.append("--start-maximized")
 
-        proxy_server = os.getenv("PROXY_SERVER")
-        proxy_config = None
-        if proxy_server:
-            proxy_config = {"server": proxy_server}
-            if os.getenv("PROXY_USERNAME"):
-                proxy_config["username"] = os.getenv("PROXY_USERNAME")
-                proxy_config["password"] = os.getenv("PROXY_PASSWORD", "")
-
         browser = await p.chromium.launch(
             headless=is_headless,
             args=chromium_args,
-            proxy=proxy_config,
+            proxy=proxy_playwright,
+            ignore_default_args=["--enable-automation"],
         )
         session.browser = browser
+
+        is_egypt = (
+            proxy_config and (
+                proxy_config.get("is_egypt", True)
+                or "eg" in str(proxy_config.get("server", "")).lower()
+                or "eg" in str(proxy_config.get("username", "")).lower()
+            )
+        )
+        locale_setting = "ar-EG" if is_egypt else "ar-SA"
+        tz_setting = "Africa/Cairo" if is_egypt else "Asia/Riyadh"
 
         bcontext = await browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                "Chrome/130.0.0.0 Safari/537.36"
             ),
-            locale="ar-SA",
-            timezone_id="Asia/Riyadh",
+            locale=locale_setting,
+            timezone_id=tz_setting,
             permissions=["geolocation"],
         )
         session.context = bcontext
@@ -1578,54 +2457,184 @@ async def launch_browser_and_request_otp(msg_target, session: RegistrationSessio
         page = await bcontext.new_page()
         session.page = page
 
+        # Auto-dismiss cookie/privacy banner (OneTrust) as soon as it mounts in DOM
+        await page.add_init_script("""
+            (() => {
+                const clickConsent = () => {
+                    try {
+                        if (window.OneTrust && typeof window.OneTrust.AcceptAll === 'function') {
+                            window.OneTrust.AcceptAll();
+                        }
+                        const b = document.getElementById('onetrust-accept-btn-handler') ||
+                                  document.getElementById('accept-recommended-btn-handler');
+                        if (b) {
+                            b.click();
+                        }
+                    } catch(e) {}
+                };
+                document.addEventListener('DOMContentLoaded', clickConsent);
+                const observer = new MutationObserver(() => {
+                    clickConsent();
+                });
+                if (document.documentElement) {
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                }
+            })();
+        """)
+
         # Apply stealth evasions
         stealth = Stealth()
         await stealth.apply_stealth_async(page)
 
         # Navigate to registration hub
-        await page.goto("https://shahid.mbc.net/ar/hub/registration", wait_until="domcontentloaded")
-        await asyncio.sleep(2)
-        await remove_cookie_banner(page)
+        await page.goto("https://shahid.mbc.net/ar/hub/registration", wait_until="domcontentloaded", timeout=45000)
+        await asyncio.sleep(1.5)
+        for _ in range(6):
+            if await remove_cookie_banner(page):
+                break
+            await asyncio.sleep(0.4)
 
-        # Enter email with human-like typing
+        # Enter email safely and trigger form validation
         user_field = page.locator("#userName")
         if not await user_field.is_visible():
-            await user_field.wait_for(timeout=7000)
+            await user_field.wait_for(timeout=15000)
 
         await remove_cookie_banner(page)
-        await human_type(page, "#userName", session.email)
+        await user_field.click()
+        await user_field.press_sequentially(session.email, delay=35)
         await asyncio.sleep(0.5)
-
-        # Click submit
-        await remove_cookie_banner(page)
-        submit_btn = page.locator("button[type='submit']")
-        try:
-            await submit_btn.click(timeout=3000)
-        except Exception:
-            await remove_cookie_banner(page)
-            await submit_btn.click(force=True)
-
-        # Wait for transition
-        await asyncio.sleep(4)
         await remove_cookie_banner(page)
 
-        # First: Check if we successfully reached the OTP verification page
-        otp_field = page.locator("#otpCode")
+        # Helper to trigger reCAPTCHA Enterprise resolution via Shahid's React Fiber
+        async def trigger_recaptcha():
+            try:
+                await page.evaluate("""async () => {
+                    const btn = document.querySelector("button[type='submit']");
+                    const key = btn ? Object.keys(btn).find(k => k.startsWith('__reactFiber')) : null;
+                    let fiber = key ? btn[key] : null;
+                    while (fiber) {
+                        if (fiber.memoizedProps?.bottomChildren?.props?.getTokenOnDemand) {
+                            const p = fiber.memoizedProps.bottomChildren.props.getTokenOnDemand('REGISTER');
+                            // Race with 3.5s timeout so it NEVER hangs
+                            await Promise.race([p, new Promise(r => setTimeout(r, 3500))]);
+                            break;
+                        }
+                        fiber = fiber.return;
+                    }
+                }""")
+            except Exception as e:
+                logger.warning(f"Note on reCAPTCHA execution: {e}")
+
+        logger.info("[*] Triggering reCAPTCHA Enterprise resolution...")
+        await trigger_recaptcha()
+
+        # Active polling loop: monitor transition and retry clicking 'متابعة' on network glitch/warning
+        logger.info("[*] Waiting for submit button to be enabled and transition to OTP screen...")
         is_otp = False
-        try:
-            if await otp_field.is_visible(timeout=5000) or "/hub/verification" in page.url:
-                is_otp = True
-        except Exception:
-            pass
+        has_clicked = False
+        last_click_time = 0.0
+        retry_count = 0
+        max_retries = 15
+
+        for s in range(90):
+            await asyncio.sleep(1.0)
+            await remove_cookie_banner(page)
+            cur_url = page.url
+
+            # 1. Success check: Reached OTP verification screen
+            try:
+                if "/hub/verification" in cur_url or await page.locator("#otpCode").is_visible(timeout=300):
+                    is_otp = True
+                    logger.info(f"[+] Reached OTP verification screen at second {s+1}!")
+                    break
+            except Exception:
+                pass
+
+            # 2. Check if redirected to login (email already registered)
+            if "/hub/login" in cur_url:
+                logger.info(f"[*] Reached login screen at second {s+1} (email already registered).")
+                break
+
+            # 3. Check for network glitch / proxy lag banner ("نشاط غير معتاد" / "تقييد الوصول" / "خطأ في الشبكة")
+            body_text = ""
+            try:
+                body_text = await page.locator("body").inner_text()
+            except Exception:
+                pass
+
+            has_network_warning = any(w in body_text for w in ["تقييد الوصول", "نشاط غير معتاد", "مشكلة في الشبكة", "خطأ في الشبكة"])
+
+            # 4. Handle clicking and retrying 'متابعة'
+            try:
+                btn = page.locator("form button[type='submit'], button:has-text('متابعة')").first
+                if await btn.is_visible(timeout=300):
+                    btn_enabled = not await btn.is_disabled()
+                    now = asyncio.get_event_loop().time()
+
+                    if btn_enabled:
+                        if not has_clicked:
+                            logger.info(f"[*] Submit button is ENABLED at second {s+1}! Waiting 3 seconds before clicking...")
+                            await asyncio.sleep(3.0)
+                            if not await btn.is_disabled():
+                                logger.info("[*] Clicking submit button now...")
+                                await btn.click()
+                                has_clicked = True
+                                last_click_time = now
+                                await asyncio.sleep(1.5)
+                        elif has_network_warning and (now - last_click_time >= 3.0) and retry_count < max_retries:
+                            retry_count += 1
+                            logger.info(f"[*] Network warning detected. Waiting 3 seconds before retry ({retry_count}/{max_retries})...")
+                            await asyncio.sleep(3.0)
+                            await trigger_recaptcha()
+                            await asyncio.sleep(1.5)
+                            # Verify button is enabled and wait 3 seconds before clicking per user instruction
+                            if await btn.is_visible(timeout=500) and not await btn.is_disabled():
+                                logger.info(f"[*] Button is ready/white. Waiting 3 seconds before clicking (attempt {retry_count}/{max_retries})...")
+                                await asyncio.sleep(3.0)
+                                try:
+                                    await btn.click()
+                                except Exception:
+                                    await page.evaluate("() => document.querySelector(\"button[type='submit'], button:has-text('متابعة')\")?.click()")
+                                last_click_time = asyncio.get_event_loop().time()
+                                await asyncio.sleep(2.0)
+                        elif not has_network_warning and (now - last_click_time >= 5.0) and (s % 4 == 0):
+                            logger.info(f"[*] Retrying submit click at second {s+1}...")
+                            await btn.click()
+                            last_click_time = now
+                            await asyncio.sleep(1.0)
+            except Exception:
+                pass
+
+        # Final retry attempts if still not on OTP screen
+        if not is_otp and not ("/hub/login" in page.url):
+            for final_try in range(2):
+                try:
+                    btn = page.locator("form button[type='submit'], button:has-text('متابعة')").first
+                    if await btn.is_visible(timeout=500) and not await btn.is_disabled():
+                        logger.info(f"[*] Final retry attempt {final_try+1} for 'متابعة'...")
+                        await trigger_recaptcha()
+                        await asyncio.sleep(1.5)
+                        await btn.click()
+                        await asyncio.sleep(3.0)
+                        if "/hub/verification" in page.url or await page.locator("#otpCode").is_visible(timeout=500):
+                            is_otp = True
+                            logger.info("[+] Reached OTP verification screen on final retry!")
+                            break
+                except Exception:
+                    pass
 
         if is_otp:
-            await status_msg.edit_text(
+            await remove_cookie_banner(page)
+            await asyncio.sleep(1.0)
+            await remove_cookie_banner(page)
+            await safe_edit_message(
+                status_msg,
                 batch_prefix +
                 f"📨 تم إرسال رمز التحقق بنجاح إلى بريدك الإلكتروني:\n`{session.email}`\n\n"
                 "🔢 **أدخل رمز التحقق (OTP) المكوّن من 6 أرقام هنا لإكمال التسجيل:**\n\n"
                 f"👥 سيتم تجهيز الملفات: `{base}1` إلى `{base}4`\n" +
                 batch_hint,
-                reply_markup=get_cancel_keyboard(),
+                reply_markup=get_otp_keyboard(),
                 parse_mode="Markdown"
             )
             return CODE
@@ -1641,10 +2650,11 @@ async def launch_browser_and_request_otp(msg_target, session: RegistrationSessio
                 curr = bi["current_index"]
                 tot = bi["total"]
                 if curr < tot:
-                    await status_msg.edit_text(
+                    await safe_edit_message(
+                        status_msg,
                         f"⚠️ البريد `{session.email}` مسجل مسبقاً في شاهد!\n"
                         "🗑️ تم حذفه تلقائياً من قائمتك لتفادي التكرار.\n\n"
-                        f"🚀 **جاري الانتقال تلقائياً للحساب التالي [{curr + 1} من {tot}]...**",
+                        f"🚀 **جاري الانتقال تلقائياً للحساب التالي ({curr + 1} من {tot})...**",
                         parse_mode="Markdown"
                     )
                     await cleanup_session(context, force=True)
@@ -1653,7 +2663,8 @@ async def launch_browser_and_request_otp(msg_target, session: RegistrationSessio
                 else:
                     return await finish_batch(msg_target, context)
 
-            await status_msg.edit_text(
+            await safe_edit_message(
+                status_msg,
                 "⚠️ هذا البريد مسجل مسبقاً في Shahid! يرجى استخدام بريد إلكتروني جديد.",
                 reply_markup=get_main_inline_keyboard(),
             )
@@ -1662,26 +2673,25 @@ async def launch_browser_and_request_otp(msg_target, session: RegistrationSessio
         # 2. Check for actual block banner
         body_text = await page.locator("body").inner_text()
         if "تقييد الوصول" in body_text or "نشاط غير معتاد" in body_text:
-            await status_msg.edit_text(
-                "⚠️ تعذر استكمال الطلب حالياً من موقع شاهد بسبب ضغط في الشبكة. يرجى المحاولة بعد قليل.",
+            await safe_edit_message(
+                status_msg,
+                "⚠️ تعذر استكمال الطلب حالياً من موقع شاهد بسبب ضغط في الشبكة بعد عدة محاولات. يرجى المحاولة بعد قليل.",
                 reply_markup=get_main_inline_keyboard(),
             )
             return ConversationHandler.END
 
-        # Fallback: prompt for OTP
-        await status_msg.edit_text(
-            batch_prefix +
-            f"📨 تم إرسال رمز التحقق إلى بريدك الإلكتروني:\n`{session.email}`\n\n"
-            "🔢 أدخل رمز التحقق (OTP) المكوّن من 6 أرقام هنا لإكمال التسجيل:\n" +
-            batch_hint,
-            reply_markup=get_cancel_keyboard(),
-            parse_mode="Markdown"
+        # Fallback: Registration did not reach verification screen
+        await safe_edit_message(
+            status_msg,
+            "⚠️ تعذر استكمال طلب كود التحقق من شاهد حالياً.\nيرجى إعادة المحاولة.",
+            reply_markup=get_main_inline_keyboard(),
         )
-        return CODE
+        return ConversationHandler.END
 
     except Exception as exc:
         logger.error(f"[!] Error in launch_browser_and_request_otp: {exc}", exc_info=True)
-        await status_msg.edit_text(
+        await safe_edit_message(
+            status_msg,
             "⚠️ تعذر الاتصال بموقع شاهد حالياً، يرجى المحاولة مجدداً.",
             reply_markup=get_cancel_keyboard(),
         )
@@ -1693,20 +2703,204 @@ async def base_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     base = "dahoom"
 
     if update.callback_query:
-        await update.callback_query.answer()
-        base = "dahoom"
-        msg = update.callback_query.message
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "act_default_name":
+            base = "dahoom"
+            session.base_name = base
+            session.custom_names = None
+            msg = query.message
+            return await launch_browser_and_request_otp(msg, session, base, context)
+
+        elif query.data == "act_custom_4_names":
+            await query.message.reply_text(
+                "✍️ **أدخل الآن الـ 4 أسماء التي تريدها للملفات الأربعة بالترتيب:**\n\n"
+                "اكتب كل اسم في سطر جديد، أو افصل بينها بفاصلة (،):\n"
+                "```text\n"
+                "الملف الأول\n"
+                "الملف الثاني\n"
+                "الملف الثالث\n"
+                "الملف الرابع\n"
+                "```\n"
+                "*(مثال: `أحمد، سارة، خالد، منى`)*\n\n"
+                "💡 سيقوم البوت بتسمية كل ملف بالاسم الذي حددته بالضبط وبنفس الترتيب بدون أي ترقيم إضافي.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏭️ استخدام dahoom الافتراضي", callback_data="act_default_name")],
+                    [InlineKeyboardButton("🚫 تخطي تسمية الملفات (حساب فقط)", callback_data="act_skip_profiles")],
+                    [InlineKeyboardButton("❌ إلغاء العملية", callback_data="act_cancel")],
+                ]),
+                parse_mode="Markdown"
+            )
+            return BASE_NAME
+
+        elif query.data == "act_skip_profiles":
+            session.skip_profiles = True
+            await query.message.reply_text(
+                "🛑 **تم اختيار تخطي تسمية الملفات!**\n"
+                "سيتوقف البوت فور إتمام إنشاء الحساب دون الدخول في إعداد أي ملفات.\n\n"
+                "🚀 جاري الانطلاق الآن لطلب كود التحقق...",
+                parse_mode="Markdown"
+            )
+            return await launch_browser_and_request_otp(query.message, session, "account", context)
+
     else:
         raw = update.message.text.strip()
-        cleaned = re.sub(r"[^\w\s-]", "", raw).strip()
-        if cleaned:
-            base = cleaned[:18]
-        else:
-            base = "dahoom"
-        msg = update.message
+        # Parse for 4 names separated by newlines, commas (Arabic or English)
+        parts = [re.sub(r"[^\w\s-]", "", p).strip() for p in re.split(r"[\n,،]+", raw)]
+        parts = [p[:18] for p in parts if p]
 
-    session.base_name = base
-    return await launch_browser_and_request_otp(msg, session, base, context)
+        if len(parts) == 4:
+            session.custom_names = parts[:4]
+            session.base_name = parts[0]
+            names_summary = "\n".join(f"  {i+1}️⃣ `{name}`" for i, name in enumerate(parts))
+            await update.message.reply_text(
+                f"✅ **تم اعتماد الـ 4 أسماء للملفات بنجاح وبنفس الترتيب:**\n{names_summary}\n\n"
+                "🚀 جاري الانطلاق الآن لطلب كود التحقق وتجهيز الحساب...",
+                parse_mode="Markdown"
+            )
+            return await launch_browser_and_request_otp(update.message, session, session.base_name, context)
+
+        elif len(parts) in (2, 3) or len(parts) > 4:
+            await update.message.reply_text(
+                f"⚠️ لقد أدخلت ({len(parts)}) أسماء والمطلوب هو **4 أسماء بالضبط** (كل اسم لملف).\n\n"
+                "يرجى إرسال الـ 4 أسماء مفصولة بسطر جديد أو فاصلة (،) أو إرسال اسم واحد فقط للترقيم التلقائي:",
+                reply_markup=get_name_keyboard(),
+                parse_mode="Markdown"
+            )
+            return BASE_NAME
+
+        else:
+            cleaned = re.sub(r"[^\w\s-]", "", raw).strip()
+            base = cleaned[:18] if cleaned else "dahoom"
+            session.base_name = base
+            session.custom_names = None
+            return await launch_browser_and_request_otp(update.message, session, base, context)
+
+
+async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles clicking '🔄 إعادة إرسال الكود' inline button during OTP verification."""
+    query = update.callback_query
+    session = get_session(context)
+
+    if not session or not session.page or session.page.is_closed():
+        await query.answer("❌ لا توجد جلسة تسجيل نشطة حالياً. يرجى بدء إنشاء الحساب من جديد.", show_alert=True)
+        return CODE
+
+    page = session.page
+    try:
+        await remove_cookie_banner(page)
+
+        # 1. Look for resend button / link on Shahid's verification screen
+        resend_selectors = [
+            "button:has-text('إعادة إرسال')",
+            "button:has-text('إعادة الإرسال')",
+            "button:has-text('ارسل الرمز مجددا')",
+            "button:has-text('ارسل الرمز مجدداً')",
+            "button:has-text('أرسل الرمز مجدداً')",
+            "button:has-text('ارسل مجددا')",
+            "button:has-text('أرسل مجدداً')",
+            "a:has-text('إعادة إرسال')",
+            "a:has-text('إعادة الإرسال')",
+            "span:has-text('إعادة إرسال')",
+            "p:has-text('إعادة إرسال')",
+            "[data-testid*='resend']",
+            "button[class*='resend']",
+        ]
+
+        resend_btn = None
+        for sel in resend_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=400):
+                    resend_btn = loc
+                    break
+            except Exception:
+                pass
+
+        btn_text = ""
+        is_disabled = False
+
+        if resend_btn:
+            try:
+                btn_text = (await resend_btn.inner_text()).strip()
+            except Exception:
+                pass
+            try:
+                is_disabled = await resend_btn.is_disabled()
+            except Exception:
+                pass
+        else:
+            info = await page.evaluate("""() => {
+                const els = Array.from(document.querySelectorAll('button, a, span, p, div'));
+                const target = els.find(el => {
+                    const t = (el.innerText || '').trim();
+                    return (t.includes('إعادة إرسال') || t.includes('إعادة الإرسال') || t.includes('ارسل الرمز') || t.includes('أرسل الرمز')) && t.length < 50;
+                });
+                if (target) {
+                    return {
+                        found: true,
+                        text: (target.innerText || '').trim(),
+                        disabled: target.disabled || target.getAttribute('aria-disabled') === 'true' || target.classList.contains('disabled') || target.classList.contains('cursor-not-allowed')
+                    };
+                }
+                return { found: false };
+            }""")
+            if info.get("found"):
+                btn_text = info.get("text", "")
+                is_disabled = info.get("disabled", False)
+
+        # 2. Check if button is disabled or in countdown cooldown
+        if is_disabled or any(w in btn_text for w in ["ثانية", "ثوان", "انتظر"]):
+            msg = f"⏳ موقع شاهد يطلب الانتظار قبل إعادة إرسال رمز جديد:\n({btn_text})"
+            await query.answer(msg, show_alert=True)
+            return CODE
+
+        # 3. Click the resend button
+        clicked = False
+        if resend_btn:
+            try:
+                await resend_btn.click(timeout=3000)
+                clicked = True
+            except Exception:
+                pass
+
+        if not clicked:
+            clicked = await page.evaluate("""() => {
+                const els = Array.from(document.querySelectorAll('button, a, span, p, div'));
+                const target = els.find(el => {
+                    const t = (el.innerText || '').trim();
+                    return (t.includes('إعادة إرسال') || t.includes('إعادة الإرسال') || t.includes('ارسل الرمز') || t.includes('أرسل الرمز')) && t.length < 50;
+                });
+                if (target) {
+                    target.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    target.click();
+                    target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    return true;
+                }
+                return false;
+            }""")
+
+        if clicked:
+            logger.info(f"[+] Resend OTP clicked successfully for {session.email}")
+            await query.answer("✅ تم طلب إعادة إرسال رمز التحقق بنجاح! يرجى فحص بريدك الإلكتروني الآن.", show_alert=True)
+            try:
+                current_text = query.message.text or ""
+                if "🔄 تم طلب رمز جديد" not in current_text:
+                    new_text = current_text + "\n\n🔄 **(تم طلب إعادة إرسال كود تحقق جديد، يرجى فحص البريد الآن!)**"
+                    await query.message.edit_text(new_text, reply_markup=get_otp_keyboard(), parse_mode="Markdown")
+            except Exception:
+                pass
+        else:
+            await query.answer("⚠️ تعذر العثور على زر إعادة الإرسال في الصفحة حالياً.", show_alert=True)
+
+    except Exception as exc:
+        logger.error(f"[!] Error in resend_otp_callback: {exc}", exc_info=True)
+        await query.answer("⚠️ حدث خطأ أثناء طلب إعادة الإرسال. يرجى المحاولة بعد قليل.", show_alert=True)
+
+    return CODE
 
 
 async def code_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1714,7 +2908,7 @@ async def code_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not re.fullmatch(r"\d{6}", val):
         await update.message.reply_text(
             "⚠️ يرجى إدخال رمز صحيح مكوّن من 6 أرقام فقط:",
-            reply_markup=get_cancel_keyboard(),
+            reply_markup=get_otp_keyboard(),
         )
         return CODE
 
@@ -1731,125 +2925,279 @@ async def code_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     status_msg = await update.message.reply_text("⏳ جاري تأكيد الرمز وإكمال التسجيل...")
 
     try:
+        await remove_cookie_banner(page)
         otp_field = page.locator("#otpCode")
         if not await otp_field.is_visible():
-            await otp_field.wait_for(timeout=5000)
+            await remove_cookie_banner(page)
+            await otp_field.wait_for(timeout=10000)
 
-        # Type OTP
-        await human_type(page, "#otpCode", val)
-        await asyncio.sleep(0.5)
+        # Type OTP using fill to ensure React enables the submit button immediately
+        await remove_cookie_banner(page)
+        await otp_field.click()
+        await otp_field.fill(val)
+
+        # Wait for submit button to be visible and enabled, then wait 3 seconds before clicking
+        submit_btn = page.locator("form button[type='submit'], button:has-text('تحقق'), button:has-text('متابعة')").first
+        for _ in range(10):
+            if await submit_btn.is_visible() and not await submit_btn.is_disabled():
+                break
+            await asyncio.sleep(0.5)
+
+        logger.info("[*] OTP submit button is enabled. Waiting 3 seconds before clicking per user instruction...")
+        await asyncio.sleep(3.0)
 
         # Click submit
-        submit_btn = page.locator("button[type='submit']")
-        await submit_btn.click()
+        await remove_cookie_banner(page)
+        logger.info("[*] Clicking OTP submit button...")
+        try:
+            await submit_btn.click(timeout=4000)
+        except Exception:
+            try:
+                await otp_field.press("Enter")
+            except Exception:
+                await submit_btn.click(force=True)
 
-        # Wait for processing
-        await asyncio.sleep(3)
+        # Resilient wait for password page with automatic retries on network pressure/glitch (up to 15 attempts)
+        pwd_field = page.locator("input[type='password']").first
+        reached_password = False
+        otp_retry_count = 0
+        max_otp_retries = 15
 
-        # Check for incorrect code error
-        body_text = await page.locator("body").inner_text()
-        if "رمز غير صحيح" in body_text or "كود غير صحيح" in body_text or "invalid" in body_text.lower():
-            await status_msg.edit_text(
-                "❌ رمز التحقق غير صحيح. يرجى التأكد وإعادة إرسال الرمز الصحيح:",
-                reply_markup=get_cancel_keyboard(),
+        for s in range(60):
+            await asyncio.sleep(1.0)
+            await remove_cookie_banner(page)
+
+            if await pwd_field.is_visible():
+                reached_password = True
+                logger.info(f"[+] Reached password screen at second {s+1}!")
+                break
+
+            # Check for incorrect code error (user input error)
+            body_text = ""
+            try:
+                body_text = await page.locator("body").inner_text()
+            except Exception:
+                pass
+
+            if any(err in body_text for err in ["رمز غير صحيح", "كود غير صحيح", "رمزاً غير صحيح", "invalid"]):
+                await safe_edit_message(
+                    status_msg,
+                    "❌ رمز التحقق غير صحيح. يرجى التأكد وإعادة إرسال الرمز الصحيح:",
+                    reply_markup=get_otp_keyboard(),
+                )
+                return CODE
+
+            # Check for network pressure / warning banner on OTP step
+            has_net_warn = any(w in body_text for w in ["تقييد الوصول", "نشاط غير معتاد", "مشكلة في الشبكة", "خطأ في الشبكة"])
+            if (has_net_warn or s % 4 == 0) and otp_retry_count < max_otp_retries:
+                otp_retry_count += 1
+                logger.info(f"[*] OTP step network lag/pressure detected. Waiting 3 seconds before retry ({otp_retry_count}/{max_otp_retries})...")
+                await asyncio.sleep(3.0)
+                try:
+                    btn = page.locator("form button[type='submit'], button:has-text('تحقق'), button:has-text('متابعة')").first
+                    if await btn.is_visible() and not await btn.is_disabled():
+                        logger.info(f"[*] OTP button is white/enabled. Waiting 3 seconds before clicking ({otp_retry_count}/{max_otp_retries})...")
+                        await asyncio.sleep(3.0)
+                        await btn.click()
+                except Exception:
+                    pass
+
+        if not reached_password:
+            await safe_edit_message(
+                status_msg,
+                "⚠️ لم يتم قبول الرمز أو حدث ضغط بالشبكة بعد 15 محاولة.\nيرجى التأكد وإعادة إرسال رمز التحقق مجدداً:",
+                reply_markup=get_otp_keyboard(),
             )
             return CODE
 
-        # Wait for password page to appear
-        pwd_field = page.locator("input[type='password']")
-        try:
-            await pwd_field.wait_for(state="visible", timeout=15000)
-        except Exception:
-            pass
+        # 1. Fill the password
+        await pwd_field.fill(session.password)
+        await asyncio.sleep(1.0)
 
-        if not await pwd_field.is_visible():
-            await status_msg.edit_text(
-                "⚠️ لم يتم قبول الرمز أو قد يكون منتهي الصلاحية.\nيرجى التأكد وإعادة إرسال رمز التحقق الصحيح:",
-                reply_markup=get_cancel_keyboard(),
-            )
-            return CODE
-
-        # 1. Type the password with comfortable human delay
-        await human_type(page, "input[type='password']", session.password)
-        await asyncio.sleep(1.5)
-
-        # 2. Close cookie banner if present to avoid interference
-        try:
-            cookie_btn = page.locator("button:has-text('حسناً'), #onetrust-accept-btn-handler")
-            if await cookie_btn.is_visible():
-                await asyncio.sleep(0.8)
-                await cookie_btn.click()
-                await asyncio.sleep(0.8)
-        except Exception:
-            pass
-
-        # 3. Defuse <a> links to prevent any accidental navigation away
+        # 2. Defuse links and check checkboxes
         await page.evaluate("""() => {
-            document.querySelectorAll('a').forEach(a => {
+            const card = document.querySelector('input[type="password"]')?.closest('div.relative, div.flex, form') || document.body;
+            card.querySelectorAll('a').forEach(a => {
                 a.onclick = (e) => { e.preventDefault(); e.stopPropagation(); return false; };
                 a.removeAttribute('href');
             });
+            ['promotionsNews', 'termsConditions'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el && !el.checked) el.click();
+            });
         }""")
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(1.5)
 
-        # 4. Check the first checkbox (Promotions) with visible pause
-        await page.evaluate("""() => {
-            const el = document.getElementById('promotionsNews');
-            if (el && !el.checked) {
-                el.click();
-            }
-        }""")
-        await asyncio.sleep(1.2)
+        # 3. Wait for submit button to be visible and enabled, then wait 3 seconds before clicking
+        submit_btn = page.locator("form button[type='submit'], button:has-text('إنشاء حساب'), button:has-text('متابعة')").first
+        for _ in range(10):
+            if await submit_btn.is_visible() and not await submit_btn.is_disabled():
+                break
+            await asyncio.sleep(0.5)
 
-        # 5. Check the second checkbox (Terms & Privacy) with visible pause
-        await page.evaluate("""() => {
-            const el = document.getElementById('termsConditions');
-            if (el && !el.checked) {
-                el.click();
-            }
-        }""")
-        await asyncio.sleep(1.8)
+        logger.info("[*] Password submit button is enabled. Waiting 3 seconds before clicking per user instruction...")
+        await asyncio.sleep(3.0)
 
-        # 6. Click submit / create account button with pause
-        submit_btn = page.locator("button:has-text('إنشاء حساب'), button[type='submit']")
         try:
             await submit_btn.click(timeout=5000)
         except Exception:
             await submit_btn.evaluate("btn => btn.click()")
 
-        # 7. Verify URL transition (Shahid redirects to /hub/onboarding or profile on success)
-        await asyncio.sleep(5)
-        current_url = page.url
+        # 4. Verify URL transition with automatic retry on network pressure/lag (up to 15 attempts)
+        logger.info("[*] Waiting for account creation and redirect to onboarding/profile...")
+        is_registered = False
+        pwd_retry_count = 0
+        max_pwd_retries = 15
 
-        if "set-password" in current_url:
+        for s in range(60):
+            await asyncio.sleep(1.0)
+            await remove_cookie_banner(page)
+            cur_url = page.url
+
+            # Redirected to onboarding, profile, home, or left set-password
+            if any(path in cur_url for path in ["/onboarding", "/profile", "/home"]) or ("set-password" not in cur_url and "/hub/" not in cur_url):
+                is_registered = True
+                logger.info(f"[+] Account creation confirmed at second {s+1}! URL: {cur_url}")
+                break
+
+            # Or onboarding name field appeared
+            try:
+                name_input = page.locator("input#profileName, input[placeholder*='اسم الملف'], input[placeholder*='الاسم']").first
+                if await name_input.is_visible():
+                    is_registered = True
+                    logger.info(f"[+] Profile onboarding input visible at second {s+1}!")
+                    break
+            except Exception:
+                pass
+
+            # Check for network pressure / warning banner on password step
+            body_text = ""
+            try:
+                body_text = await page.locator("body").inner_text()
+            except Exception:
+                pass
+
+            has_net_warn = any(w in body_text for w in ["تقييد الوصول", "نشاط غير معتاد", "مشكلة في الشبكة", "خطأ في الشبكة"])
+            if (has_net_warn or s % 4 == 0) and pwd_retry_count < max_pwd_retries:
+                pwd_retry_count += 1
+                logger.info(f"[*] Account creation network lag detected. Waiting 3 seconds before retry ({pwd_retry_count}/{max_pwd_retries})...")
+                await asyncio.sleep(3.0)
+                try:
+                    btn = page.locator("form button[type='submit'], button:has-text('إنشاء حساب'), button:has-text('متابعة')").first
+                    if await btn.is_visible() and not await btn.is_disabled():
+                        logger.info(f"[*] 'إنشاء حساب' button is white/enabled. Waiting 3 seconds before clicking ({pwd_retry_count}/{max_pwd_retries})...")
+                        await asyncio.sleep(3.0)
+                        await btn.click()
+                except Exception:
+                    pass
+
+        if not is_registered:
             body = await page.locator("body").inner_text()
             error_line = "لم يتم تأكيد الحساب بعد أو هناك خطأ بكلمة المرور."
             for line in body.split("\n"):
                 clean = line.strip()
-                if any(w in clean for w in ["خطأ", "كلمة السر يجب", "غير صحيح", "مطلوب"]):
+                if "يجب أن تتكون من 8" in clean:
+                    continue  # Skip static requirement text
+                if any(w in clean for w in ["خطأ", "غير صحيح", "مطلوب", "تعذر", "فشل"]):
                     error_line = clean
                     break
-            await status_msg.edit_text(
+            await safe_edit_message(
+                status_msg,
                 f"⚠️ تنبيه: لم يكتمل إنشاء الحساب بعد.\nالسبب: {error_line}\n\nيرجى المحاولة مجدداً.",
                 reply_markup=get_main_inline_keyboard(),
             )
             return ConversationHandler.END
 
+        user_id = update.effective_user.id
+        user_settings = get_user_settings(user_id)
+        should_create_profiles = user_settings.get("create_profiles_enabled", True) and not getattr(session, "skip_profiles", False)
+
+        if not should_create_profiles:
+            # STOP HERE! User chose NOT to create/name profiles!
+            profiles_list = ["(تم تخطي الملفات بناءً على اختيارك)"]
+            proxy_used = session.proxy_config.get("host", "") if getattr(session, "proxy_config", None) else ""
+            save_account(user_id, session.email, session.password, profiles_list, proxy=proxy_used)
+            pop_user_queued_email(user_id, session.email)
+
+            batch_info = context.user_data.get("batch_info")
+            if batch_info:
+                batch_info["success_count"] += 1
+                batch_info["current_index"] += 1
+                curr_done = batch_info["current_index"]
+                tot = batch_info["total"]
+
+                if curr_done < tot:
+                    next_email = batch_info["emails"][curr_done]
+                    await safe_edit_message(
+                        status_msg,
+                        f"✅ **(تم إنجاز الحساب {curr_done} من {tot} بنجاح!)**\n\n"
+                        f"📧 البريد: `{session.email}`\n"
+                        "👤 الملفات: *(تم التخطي)*\n"
+                        "🗑️ تم حذف الإيميل تلقائياً من قائمتك لعدم التكرار.\n"
+                        "──────────────────────────\n"
+                        f"🚀 **جاري الانتقال تلقائياً للحساب التالي ({curr_done + 1} من {tot})...**\n"
+                        f"📧 البريد: `{next_email}`",
+                        parse_mode="Markdown"
+                    )
+                    await cleanup_session(context, force=True)
+                    await asyncio.sleep(2.0)
+                    return await start_batch_next_account(update.effective_message, context)
+                else:
+                    return await finish_batch(update.effective_message, context)
+
+            success_markup = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("📋 عرض حساباتي", callback_data="act_my_accounts"),
+                    InlineKeyboardButton("➕ إنشاء حساب آخر", callback_data="act_create"),
+                ],
+                [
+                    InlineKeyboardButton("📥 تصدير كملف نصي", callback_data="act_export"),
+                    InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="act_menu"),
+                ]
+            ])
+
+            await safe_edit_message(
+                status_msg,
+                "🎉 **تهانينا! تم إنشاء وتأكيد الحساب بنجاح في Shahid!**\n\n"
+                f"📧 البريد: `{session.email}`\n"
+                f"🔑 كلمة المرور: `{session.password}`\n"
+                "👤 الملفات: *(تم التوقف فور تأكيد الحساب دون إعداد ملفات شخصية)*\n\n"
+                "💾 *تم حفظ الحساب تلقائياً في قائمة حساباتك!*\n"
+                "✨ الحساب جاهز الآن للاستخدام!",
+                reply_markup=success_markup,
+                parse_mode="Markdown"
+            )
+            await cleanup_session(context, force=True)
+            return ConversationHandler.END
+
         # Account created successfully! Now automate setting up all 4 profiles
         base = getattr(session, "base_name", "dahoom") or "dahoom"
-        await status_msg.edit_text(
-            "🎉 **تم تأكيد الحساب بنجاح!**\n\n"
-            f"⏳ جاري الآن تجهيز كافة الملفات الشخصية تلقائياً (`{base}1` إلى `{base}4`)...\n"
-            "يرجى الانتظار لحظات..."
+        custom_names = getattr(session, "custom_names", None)
+
+        if custom_names and len(custom_names) == 4:
+            names_display = ", ".join(f"`{n}`" for n in custom_names)
+            status_text = f"⏳ جاري الآن تجهيز كافة الملفات الشخصية بأسمائك المخصصة ({names_display})...\nيرجى الانتظار لحظات..."
+            profiles_list = list(custom_names)
+        else:
+            names_display = f"`{base}1` إلى `{base}4`"
+            status_text = f"⏳ جاري الآن تجهيز كافة الملفات الشخصية تلقائياً ({names_display})...\nيرجى الانتظار لحظات..."
+            profiles_list = [f"{base}1", f"{base}2", f"{base}3", f"{base}4"]
+
+        await safe_edit_message(
+            status_msg,
+            "🎉 **تم تأكيد الحساب بنجاح!**\n\n" + status_text,
+            parse_mode="Markdown"
         )
 
         # Run profile automation sequence
-        await automate_all_profiles(page, status_msg, base_name=base)
+        created_profiles = await automate_all_profiles(page, status_msg, base_name=base, custom_names=custom_names)
+        if created_profiles and len(created_profiles) == 4:
+            profiles_list = created_profiles
 
         # Save account locally
         user_id = update.effective_user.id
-        profiles_list = [f"{base}1", f"{base}2", f"{base}3", f"{base}4"]
-        save_account(user_id, session.email, session.password, profiles_list)
+        proxy_used = session.proxy_config.get("host", "") if getattr(session, "proxy_config", None) else ""
+        save_account(user_id, session.email, session.password, profiles_list, proxy=proxy_used)
 
         # Remove successfully created email from user's queue immediately so it never repeats!
         pop_user_queued_email(user_id, session.email)
@@ -1864,13 +3212,15 @@ async def code_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
             if curr_done < tot:
                 next_email = batch_info["emails"][curr_done]
-                await status_msg.edit_text(
-                    f"✅ **[تم إنجاز الحساب {curr_done} من {tot} بنجاح!]**\n\n"
+                p_batch = ", ".join(f"`{n}`" for n in profiles_list)
+                await safe_edit_message(
+                    status_msg,
+                    f"✅ **(تم إنجاز الحساب {curr_done} من {tot} بنجاح!)**\n\n"
                     f"📧 البريد: `{session.email}`\n"
-                    f"👤 الملفات: `{base}1` إلى `{base}4`\n"
+                    f"👤 الملفات: {p_batch}\n"
                     "🗑️ تم حذف الإيميل تلقائياً من قائمتك لعدم التكرار.\n"
                     "──────────────────────────\n"
-                    f"🚀 **جاري الانتقال تلقائياً للحساب التالي [{curr_done + 1} من {tot}]...**\n"
+                    f"🚀 **جاري الانتقال تلقائياً للحساب التالي ({curr_done + 1} من {tot})...**\n"
                     f"📧 البريد: `{next_email}`",
                     parse_mode="Markdown"
                 )
@@ -1892,15 +3242,14 @@ async def code_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         ])
 
         # Final success message with all 4 profiles confirmed
-        await status_msg.edit_text(
+        p_lines = "\n".join(f"{i+1}️⃣ `{name}`" for i, name in enumerate(profiles_list))
+        await safe_edit_message(
+            status_msg,
             "🎉 **تهانينا! تم إنشاء وتجهيز الحساب بالكامل في Shahid!**\n\n"
             f"📧 البريد: `{session.email}`\n"
             f"🔑 كلمة المرور: `{session.password}`\n\n"
             "👤 **الملفات الشخصية المجهزة:**\n"
-            f"1️⃣ `{base}1`\n"
-            f"2️⃣ `{base}2`\n"
-            f"3️⃣ `{base}3`\n"
-            f"4️⃣ `{base}4`\n\n"
+            f"{p_lines}\n\n"
             "💾 *تم حفظ الحساب تلقائياً في قائمة حساباتك!*\n"
             "✨ الحساب جاهز الآن للاستخدام والمشاهدة بأعلى جودة!",
             reply_markup=success_markup,
@@ -1915,8 +3264,9 @@ async def code_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             batch_info["failed_emails"].append((session.email, str(exc)))
             batch_info["current_index"] += 1
             if batch_info["current_index"] < batch_info["total"]:
-                await status_msg.edit_text(
-                    f"⚠️ حدث تنبيه في الحساب [{curr_idx + 1} من {tot}]: {exc}\n\n"
+                await safe_edit_message(
+                    status_msg,
+                    f"⚠️ حدث تنبيه في الحساب ({curr_idx + 1} من {tot}): {exc}\n\n"
                     "⏭️ جاري الانتقال تلقائياً إلى الإيميل التالي في القائمة...",
                     parse_mode="Markdown"
                 )
@@ -1926,6 +3276,7 @@ async def code_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             else:
                 return await finish_batch(update.effective_message, context)
 
+        logger.error(f"[!] Error in code_step: {exc}", exc_info=True)
         await status_msg.edit_text(
             "⚠️ تعذر استكمال إنشاء الحساب حالياً، يرجى المحاولة مجدداً.",
             reply_markup=get_main_inline_keyboard(update.effective_user.id if update.effective_user else 0),
@@ -1948,11 +3299,13 @@ async def show_accounts(user_id: int, send_fn, edit: bool = False) -> None:
         text = f"📋 **قائمة حساباتك المسجلة في Shahid** (الإجمالي: {len(accounts)}):\n\n"
         for idx, acc in enumerate(accounts, 1):
             profiles_str = " | ".join(acc.get("profiles", []))
+            proxy_line = f"🌐 البروكسي: `{acc['proxy']}`\n" if acc.get("proxy") else ""
             text += (
                 f"**{idx}️⃣ الحساب #{idx}:**\n"
                 f"📧 البريد: `{acc['email']}`\n"
                 f"🔑 كلمة المرور: `{acc['password']}`\n"
                 f"👤 الملفات: `{profiles_str}`\n"
+                f"{proxy_line}"
                 f"📅 التاريخ: `{acc.get('created_at', 'غير متوفر')}`\n"
                 "──────────────────\n"
             )
@@ -1998,6 +3351,8 @@ async def export_accounts_handler(update: Update, context: ContextTypes.DEFAULT_
     for idx, acc in enumerate(accounts, 1):
         buf.write(f"[{idx}] {acc['email']}:{acc['password']}\n")
         buf.write(f"    Profiles: {', '.join(acc.get('profiles', []))}\n")
+        if acc.get("proxy"):
+            buf.write(f"    Proxy: {acc['proxy']}\n")
         buf.write(f"    Date: {acc.get('created_at', '')}\n\n")
 
     bytes_file = io.BytesIO(buf.getvalue().encode("utf-8"))
@@ -2084,24 +3439,30 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await cleanup_session(context, force=True)
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id if update.effective_user else 0
 
     batch_info = context.user_data.get("batch_info")
     if batch_info:
         succ = batch_info.get("success_count", 0)
         tot = batch_info.get("total", 0)
-        rem = len(get_user_queued_emails(user_id))
+        rem = len(get_user_queued_emails(user_id)) if user_id else 0
         msg_text = (
-            "🚫 **تم إيقاف عملية الإنشاء التلقائي.**\n\n"
+            "🚫 **تم إيقاف عملية الإنشاء التلقائي وإلغاؤها بنجاح.**\n\n"
             f"• الحسابات التي تم إنجازها بنجاح: `{succ}` من `{tot}`\n"
             f"• تم حفظ الحسابات الناجحة وحذفها من القائمة تلقائياً.\n"
             f"• الإيميلات المتبقية في قائمتك: `{rem}` إيميل محفوظة بأمان."
         )
-        context.user_data["batch_info"] = None
     else:
-        msg_text = "🚫 **تم إلغاء العملية.**\n\nاختر من الأزرار أدناه للبدء من جديد:"
+        msg_text = "🚫 **تم إلغاء العملية والعودة للقائمة الرئيسية.**\n\nاختر من الأزرار أدناه للبدء من جديد:"
+
+    context.user_data.pop("batch_info", None)
+    context.user_data.pop("pending_proxies", None)
+
     if update.callback_query:
-        await update.callback_query.answer("تم الإلغاء")
+        try:
+            await update.callback_query.answer("تم إلغاء العملية")
+        except Exception:
+            pass
         try:
             await update.callback_query.message.edit_text(
                 msg_text,
@@ -2112,11 +3473,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         except Exception:
             pass
 
-    await update.effective_message.reply_text(
-        msg_text,
-        reply_markup=get_main_inline_keyboard(user_id),
-        parse_mode="Markdown"
-    )
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            msg_text,
+            reply_markup=get_main_inline_keyboard(user_id),
+            parse_mode="Markdown"
+        )
     return ConversationHandler.END
 
 
@@ -2279,6 +3641,25 @@ async def toggle_perm_name_callback(update: Update, context: ContextTypes.DEFAUL
 
     toggle_user_perm_name(user_id)
     await show_perm_name_settings(user_id, query.message.edit_text, is_edit=True)
+
+
+async def toggle_create_profiles_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    new_state = toggle_user_create_profiles(user_id)
+    if new_state:
+        alert_text = "🟢 تم تفعيل ميزة تجهيز الملفات!\nالآن سيقوم البوت بإعداد وتسمية الملفات الـ 4 كاملة تلقائياً."
+    else:
+        alert_text = "🔴 تم إيقاف ميزة تجهيز الملفات!\nالآن سيتوقف البوت فور اكتمال إنشاء الحساب دون إعداد أي ملفات شخصية."
+    try:
+        await query.answer(alert_text, show_alert=True)
+    except Exception:
+        pass
+    try:
+        await query.message.edit_reply_markup(reply_markup=get_main_inline_keyboard(user_id))
+    except Exception:
+        pass
 
 
 async def edit_perm_name_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2903,6 +4284,282 @@ async def save_queued_emails_step(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
+async def show_proxies_panel(user_id: int, send_or_edit_fn, is_edit: bool = False) -> None:
+    info = get_user_proxy_info(user_id)
+    proxies = info.get("proxies", [])
+    count = len(proxies)
+    rotation_enabled = info.get("rotation_enabled", True)
+    cur_idx = info.get("current_index", 0)
+
+    rot_status = "🟢 مفعّل (بروكسي جديد مع كل حساب)" if rotation_enabled else "🔴 معطّل (استخدام أول بروكسي)"
+
+    text = (
+        "🌐 **إدارة البروكسيات والتدوير التلقائي (Proxy Manager):**\n\n"
+        f"• **عدد البروكسيات المسجلة:** `{count}` بروكسي\n"
+        f"• **نظام التدوير التلقائي:** {rot_status}\n"
+    )
+
+    if proxies:
+        next_p = proxies[cur_idx % count]
+        next_host = next_p.get("host") or next_p.get("server", "").replace("http://", "")
+        text += f"• **البروكسي التالي بالدور:** `{next_host}` (رقم {(cur_idx % count) + 1} من {count})\n\n"
+
+        preview_count = min(count, 8)
+        preview_lines = []
+        for i in range(preview_count):
+            p = proxies[i]
+            h = p.get("host") or p.get("server", "").replace("http://", "")
+            preview_lines.append(f"• `{h}`")
+        if count > 8:
+            preview_lines.append(f"*... والمزيد ({count - 8} بروكسي آخر)*")
+        text += "📋 **معاينة البروكسيات المسجلة:**\n" + "\n".join(preview_lines) + "\n\n"
+    else:
+        env_server = os.getenv("PROXY_SERVER")
+        if env_server:
+            text += f"• **البروكسي الافتراضي (.env):** `{env_server}`\n\n"
+        else:
+            text += "• **البروكسي:** *لا توجد بروكسيات مسجلة (اتصال مباشر)*\n\n"
+        text += "📭 *قائمتك فارغة حالياً. اضغط على '➕ إضافة / رفع بروكسيات' بالأسفل لبدء إضافتها.*\n\n"
+
+    text += (
+        "💡 **كيف تعمل هذه الميزة؟**\n"
+        "1️⃣ يمكنك إرسال ملف نصي `.txt` يحتوي على قائمة البروكسيات (مثل ملف Webshare) أو إرسالها كنص في الشات.\n"
+        "2️⃣ يدعم البوت صيغة `IP:PORT:USERNAME:PASSWORD` والصيغ القياسية الأخرى.\n"
+        "3️⃣ في كل عملية إنشاء حساب (فردي أو تلقائي)، يسحب البوت بروكسي جديد تلقائياً لضمان عدم حظر الـ IP!\n"
+        "4️⃣ يمكنك اختيار استبدال القائمة بالكامل أو دمج البروكسيات الجديدة مع القديمة."
+    )
+
+    rot_btn_text = "🔄 التدوير: 🟢 مفعّل" if rotation_enabled else "🔄 التدوير: 🔴 معطّل"
+    buttons = [
+        [
+            InlineKeyboardButton("➕ إضافة / رفع بروكسيات", callback_data="act_prompt_add_proxies"),
+            InlineKeyboardButton(rot_btn_text, callback_data="act_toggle_proxy_rotation"),
+        ]
+    ]
+    if proxies:
+        buttons.append([
+            InlineKeyboardButton("🗑️ مسح جميع البروكسيات", callback_data="act_confirm_clear_proxies"),
+        ])
+    buttons.append([
+        InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="act_menu"),
+    ])
+
+    markup = InlineKeyboardMarkup(buttons)
+    if is_edit:
+        try:
+            await send_or_edit_fn(text, reply_markup=markup, parse_mode="Markdown")
+            return
+        except Exception:
+            pass
+    await send_or_edit_fn(text, reply_markup=markup, parse_mode="Markdown")
+
+
+async def proxies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await show_proxies_panel(update.effective_user.id, update.effective_message.reply_text, is_edit=False)
+
+
+async def proxies_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("pending_proxies", None)
+    await show_proxies_panel(update.effective_user.id, query.message.edit_text, is_edit=True)
+
+
+async def toggle_proxy_rotation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    toggle_user_proxy_rotation(user_id)
+    await show_proxies_panel(user_id, query.message.edit_text, is_edit=True)
+
+
+async def confirm_clear_proxies_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗑️ نعم، افرغ القائمة", callback_data="act_do_clear_proxies"),
+            InlineKeyboardButton("❌ تراجع", callback_data="act_proxies"),
+        ]
+    ])
+    await query.message.edit_text(
+        "⚠️ **هل أنت متأكد من رغبتك في تفريغ ومسح جميع البروكسيات من قائمتك؟**\n\n"
+        "لا يمكن التراجع عن هذه الخطوة بعد التأكيد.",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+
+async def do_clear_proxies_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    clear_user_proxies(user_id)
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 رجوع لإدارة البروكسيات", callback_data="act_proxies")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="act_menu")],
+    ])
+    await query.message.edit_text(
+        "✅ **تم تفريغ ومسح قائمة البروكسيات بنجاح.**",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+
+async def prompt_add_proxies_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    current_count = len(get_user_proxies(user_id))
+
+    prompt = (
+        "📥 **أرسل الآن قائمة البروكسيات الجديدة التي تريد استخدامها:**\n\n"
+        f"• **البروكسيات المسجلة حالياً:** `{current_count}` بروكسي\n\n"
+        "📌 **طرق الإرسال المدعومة:**\n"
+        "1️⃣ أرسل ملف نصي `.txt` يحتوي على قائمة البروكسيات (مثل ملف Webshare).\n"
+        "2️⃣ أو أرسل البروكسيات في رسالة نصية مباشرة (كل بروكسي في سطر).\n\n"
+        "💡 **الصيغ المدعومة:**\n"
+        "• `IP:PORT:USERNAME:PASSWORD` (مثل: `154.73.250.236:6137:user:pass`)\n"
+        "• `IP:PORT` (بدون مصادقة)\n"
+        "• `http://user:pass@ip:port`\n\n"
+        "للتراجع اضغط الزر أدناه:"
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ إلغاء", callback_data="act_proxies")]
+    ])
+    if update.callback_query:
+        await update.callback_query.answer()
+        try:
+            await update.callback_query.message.edit_text(prompt, reply_markup=markup, parse_mode="Markdown")
+        except Exception:
+            await update.callback_query.message.reply_text(prompt, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await update.effective_message.reply_text(prompt, reply_markup=markup, parse_mode="Markdown")
+    return INPUT_PROXIES
+
+
+async def save_proxies_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    raw_text = ""
+
+    if update.message.document:
+        doc = update.message.document
+        doc_name = (doc.file_name or "").lower()
+        if doc_name.endswith((".txt", ".csv", ".log", ".json")):
+            file = await context.bot.get_file(doc.file_id)
+            content = await file.download_as_bytearray()
+            raw_text = content.decode("utf-8", errors="ignore")
+        else:
+            await update.message.reply_text(
+                "⚠️ يرجى إرسال ملف نصي بصيغة `.txt` أو إرسال البروكسيات كنص عادي:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ إلغاء", callback_data="act_proxies")]
+                ]),
+            )
+            return INPUT_PROXIES
+    elif update.message.text:
+        raw_text = update.message.text
+
+    parsed = parse_proxies_text(raw_text)
+    if not parsed:
+        await update.message.reply_text(
+            "⚠️ لم يتم العثور على أي بروكسي صالح في رسالتك!\n\n"
+            "يرجى التأكد من الصيغة الصحيحة مثل:\n"
+            "`154.73.250.236:6137:username:password`\n\n"
+            "أعد المحاولة الآن أو اضغط إلغاء:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ إلغاء", callback_data="act_proxies")]
+            ]),
+        )
+        return INPUT_PROXIES
+
+    existing = get_user_proxies(user_id)
+    if existing:
+        context.user_data["pending_proxies"] = parsed
+        markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔄 استبدال القائمة بالكامل (مسح القديم)", callback_data="act_proxy_replace"),
+            ],
+            [
+                InlineKeyboardButton("➕ إبقاء القديم والدمج (إضافة للجديد)", callback_data="act_proxy_append"),
+            ],
+            [
+                InlineKeyboardButton("❌ إلغاء العملية", callback_data="act_proxies"),
+            ]
+        ])
+        await update.message.reply_text(
+            f"📥 **تم التعرف على `{len(parsed)}` بروكسي صالح!**\n\n"
+            f"⚠️ **لديك بالفعل `{len(existing)}` بروكسي مسجل في قائمتك.**\n\n"
+            "👇 **كيف ترغب في حفظ البروكسيات الجديدة؟**\n"
+            "• **استبدال:** مسح البروكسيات القديمة وبدء قائمة جديدة.\n"
+            "• **إبقاء ودمج:** إضافة البروكسيات الجديدة وتخطي المكرر.",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        return CONFIRM_PROXY_MODE
+    else:
+        added, dup, total = add_user_proxies(user_id, parsed, replace=True)
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 عرض قائمة البروكسيات", callback_data="act_proxies")],
+            [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="act_menu")],
+        ])
+        await update.message.reply_text(
+            f"✅ **تم حفظ `{total}` بروكسي بنجاح في قائمتك!**\n\n"
+            "🔄 **التدوير التلقائي مفعّل:** في كل عملية إنشاء حساب، سيتم استخدام بروكسي جديد مختلف بالترتيب.",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+
+async def proxy_replace_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    pending = context.user_data.pop("pending_proxies", [])
+    if not pending:
+        await query.message.edit_text("⚠️ لا توجد بروكسيات معلقة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="act_proxies")]]))
+        return ConversationHandler.END
+
+    added, dup, total = add_user_proxies(user_id, pending, replace=True)
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 عرض قائمة البروكسيات", callback_data="act_proxies")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="act_menu")],
+    ])
+    await query.message.edit_text(
+        f"✅ **تم استبدال البروكسيات السابقة بنجاح!**\n\n"
+        f"• تم مسح البروكسيات القديمة بالكامل.\n"
+        f"• إجمالي البروكسيات الجديدة المسجلة: `{total}` بروكسي\n"
+        "🔄 تم ضبط مؤشر التدوير للبدء من أول بروكسي جديد.",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+
+async def proxy_append_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    pending = context.user_data.pop("pending_proxies", [])
+    if not pending:
+        await query.message.edit_text("⚠️ لا توجد بروكسيات معلقة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="act_proxies")]]))
+        return ConversationHandler.END
+
+    added, dup, total = add_user_proxies(user_id, pending, replace=False)
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 عرض قائمة البروكسيات", callback_data="act_proxies")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="act_menu")],
+    ])
+    await query.message.edit_text(
+        f"✅ **تم دمج البروكسيات الجديدة بنجاح!**\n\n"
+        f"• البروكسيات المضافة حديثاً: `{added}`\n"
+        f"• البروكسيات المكررة (تم تخطيها): `{dup}`\n"
+        f"• إجمالي البروكسيات المتاحة الآن: `{total}` بروكسي",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -2921,12 +4578,17 @@ def main() -> None:
             CommandHandler("setname", edit_perm_name_entry),
             CommandHandler("setcontact", edit_admin_contact_entry),
             CommandHandler("addemails", prompt_add_emails_entry),
+            CommandHandler("proxies", proxies_command),
+            CommandHandler("proxy", proxies_command),
+            CommandHandler("addproxies", prompt_add_proxies_entry),
             MessageHandler(filters.Regex(r"^(\+|➕)?\s*إنشاء حساب"), start_registration_entry),
             CallbackQueryHandler(start_registration_entry, pattern="^act_create$"),
             CallbackQueryHandler(choose_queue_prompt, pattern="^act_start_queue_create$"),
             CallbackQueryHandler(handle_batch_count_choice, pattern="^act_choose_manual$"),
             CallbackQueryHandler(handle_batch_count_choice, pattern="^act_choose_queue$"),
             CallbackQueryHandler(prompt_add_emails_entry, pattern="^act_prompt_add_emails$"),
+            CallbackQueryHandler(prompt_add_proxies_entry, pattern="^act_prompt_add_proxies$"),
+            CallbackQueryHandler(proxies_callback, pattern="^act_proxies$"),
             CallbackQueryHandler(edit_perm_pass_entry, pattern="^act_edit_perm_pass$"),
             CallbackQueryHandler(edit_perm_name_entry, pattern="^act_edit_perm_name$"),
             CallbackQueryHandler(edit_admin_contact_entry, pattern="^act_edit_admin_contact$"),
@@ -2936,67 +4598,83 @@ def main() -> None:
                 CallbackQueryHandler(choose_manual_callback, pattern="^act_choose_manual$"),
                 CallbackQueryHandler(choose_queue_prompt, pattern="^act_choose_queue$"),
                 CallbackQueryHandler(handle_batch_count_choice, pattern="^act_batch_"),
-                CallbackQueryHandler(cancel, pattern="^act_cancel$"),
-                MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_batch_count_choice),
             ],
             BATCH_PASSWORD: [
-                CallbackQueryHandler(cancel, pattern="^act_cancel$"),
-                MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, batch_password_step),
             ],
             INPUT_QUEUED_EMAILS: [
                 CallbackQueryHandler(email_queue_callback, pattern="^act_email_queue$"),
-                CallbackQueryHandler(cancel, pattern="^act_cancel$"),
-                MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
                 MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, save_queued_emails_step),
             ],
+            INPUT_PROXIES: [
+                CallbackQueryHandler(proxies_callback, pattern="^act_proxies$"),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
+                MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, save_proxies_step),
+            ],
+            CONFIRM_PROXY_MODE: [
+                CallbackQueryHandler(proxy_replace_callback, pattern="^act_proxy_replace$"),
+                CallbackQueryHandler(proxy_append_callback, pattern="^act_proxy_append$"),
+                CallbackQueryHandler(proxies_callback, pattern="^act_proxies$"),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
+            ],
             EMAIL: [
-                CallbackQueryHandler(cancel, pattern="^act_cancel$"),
-                MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, email_step),
             ],
             PASSWORD: [
-                CallbackQueryHandler(cancel, pattern="^act_cancel$"),
-                MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, password_step),
             ],
             BASE_NAME: [
-                CallbackQueryHandler(cancel, pattern="^act_cancel$"),
-                CallbackQueryHandler(base_name_step, pattern="^act_default_name$"),
-                MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                CallbackQueryHandler(base_name_step, pattern="^(act_default_name|act_custom_4_names|act_skip_profiles)$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, base_name_step),
             ],
             CODE: [
-                CallbackQueryHandler(cancel, pattern="^act_cancel$"),
-                MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
+                CallbackQueryHandler(resend_otp_callback, pattern="^act_resend_otp$"),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, code_step),
             ],
             SET_PERM_PASS: [
                 CallbackQueryHandler(perm_pass_callback, pattern="^act_perm_pass$"),
-                CallbackQueryHandler(cancel, pattern="^act_cancel$"),
-                MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_perm_pass_step),
             ],
             SET_PERM_NAME: [
                 CallbackQueryHandler(perm_name_callback, pattern="^act_perm_name$"),
-                CallbackQueryHandler(cancel, pattern="^act_cancel$"),
-                MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_perm_name_step),
             ],
             SET_ADMIN_CONTACT: [
                 CallbackQueryHandler(admin_contact_callback, pattern="^act_admin_contact$"),
-                CallbackQueryHandler(cancel, pattern="^act_cancel$"),
-                MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
+                CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+                MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_admin_contact_step),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
             CommandHandler("start", start_command),
-            MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel),
-            CallbackQueryHandler(cancel, pattern="^act_cancel$"),
+            MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel),
+            CallbackQueryHandler(cancel, pattern="^act_cancel.*$"),
+            CallbackQueryHandler(resend_otp_callback, pattern="^act_resend_otp$"),
             CallbackQueryHandler(email_queue_callback, pattern="^act_email_queue$"),
+            CallbackQueryHandler(proxies_callback, pattern="^act_proxies$"),
             CallbackQueryHandler(perm_pass_callback, pattern="^act_perm_pass$"),
             CallbackQueryHandler(perm_name_callback, pattern="^act_perm_name$"),
             CallbackQueryHandler(admin_contact_callback, pattern="^act_admin_contact$"),
@@ -3010,6 +4688,9 @@ def main() -> None:
     app.add_handler(CommandHandler("emails", email_queue_command))
     app.add_handler(CommandHandler("queue", email_queue_command))
     app.add_handler(CommandHandler("addemails", prompt_add_emails_entry))
+    app.add_handler(CommandHandler("proxies", proxies_command))
+    app.add_handler(CommandHandler("proxy", proxies_command))
+    app.add_handler(CommandHandler("addproxies", prompt_add_proxies_entry))
     app.add_handler(CommandHandler("password", perm_pass_command))
     app.add_handler(CommandHandler("name", perm_name_command))
     app.add_handler(CommandHandler("profilename", perm_name_command))
@@ -3029,23 +4710,32 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(MessageHandler(filters.Regex(r"^📋\s*حساباتي"), my_accounts_command))
     app.add_handler(MessageHandler(filters.Regex(r"^📬?\s*(قائمة )?الإيميلات"), email_queue_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^🌐\s*(إدارة\s*)?البروكسيات"), proxies_command))
     app.add_handler(MessageHandler(filters.Regex(r"^🔐\s*كلمة المرور الدائمة"), perm_pass_command))
     app.add_handler(MessageHandler(filters.Regex(r"^👤\s*اسم الملفات المحفوظ"), perm_name_command))
     app.add_handler(MessageHandler(filters.Regex(r"^👥\s*(المشتركين|إدارة المشتركين)"), subs_command))
     app.add_handler(MessageHandler(filters.Regex(r"^(📞|👤)?\s*حساب (التواصل|الدعم|الإدارة)"), admin_contact_command))
     app.add_handler(MessageHandler(filters.Regex(r"^⏳\s*اشتراكي"), my_sub_handler))
     app.add_handler(MessageHandler(filters.Regex(r"^ℹ️\s*تعليمات"), help_handler))
-    app.add_handler(MessageHandler(filters.Regex(r"^(❌|إلغاء)"), cancel))
+    app.add_handler(MessageHandler(filters.Regex(r"^(❌|إلغاء|الغاء|تراجع)"), cancel))
     app.add_handler(CallbackQueryHandler(my_accounts_callback, pattern="^act_my_accounts$"))
     app.add_handler(CallbackQueryHandler(email_queue_callback, pattern="^act_email_queue$"))
     app.add_handler(CallbackQueryHandler(confirm_clear_queue_callback, pattern="^act_confirm_clear_queue$"))
     app.add_handler(CallbackQueryHandler(do_clear_queue_callback, pattern="^act_do_clear_queue$"))
+    app.add_handler(CallbackQueryHandler(proxies_callback, pattern="^act_proxies$"))
+    app.add_handler(CallbackQueryHandler(prompt_add_proxies_entry, pattern="^act_prompt_add_proxies$"))
+    app.add_handler(CallbackQueryHandler(toggle_proxy_rotation_callback, pattern="^act_toggle_proxy_rotation$"))
+    app.add_handler(CallbackQueryHandler(confirm_clear_proxies_callback, pattern="^act_confirm_clear_proxies$"))
+    app.add_handler(CallbackQueryHandler(do_clear_proxies_callback, pattern="^act_do_clear_proxies$"))
+    app.add_handler(CallbackQueryHandler(proxy_replace_callback, pattern="^act_proxy_replace$"))
+    app.add_handler(CallbackQueryHandler(proxy_append_callback, pattern="^act_proxy_append$"))
     app.add_handler(CallbackQueryHandler(perm_pass_callback, pattern="^act_perm_pass$"))
     app.add_handler(CallbackQueryHandler(toggle_perm_pass_callback, pattern="^act_toggle_perm_pass$"))
     app.add_handler(CallbackQueryHandler(edit_perm_pass_entry, pattern="^act_edit_perm_pass$"))
     app.add_handler(CallbackQueryHandler(perm_name_callback, pattern="^act_perm_name$"))
     app.add_handler(CallbackQueryHandler(toggle_perm_name_callback, pattern="^act_toggle_perm_name$"))
     app.add_handler(CallbackQueryHandler(edit_perm_name_entry, pattern="^act_edit_perm_name$"))
+    app.add_handler(CallbackQueryHandler(toggle_create_profiles_callback, pattern="^act_toggle_create_profiles$"))
     app.add_handler(CallbackQueryHandler(subs_callback, pattern="^act_subs$"))
     app.add_handler(CallbackQueryHandler(admin_contact_callback, pattern="^act_admin_contact$"))
     app.add_handler(CallbackQueryHandler(edit_admin_contact_entry, pattern="^act_edit_admin_contact$"))
@@ -3056,7 +4746,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(confirm_clear_callback, pattern="^act_confirm_clear$"))
     app.add_handler(CallbackQueryHandler(do_clear_callback, pattern="^act_do_clear$"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^act_menu$"))
-    app.add_handler(CallbackQueryHandler(cancel, pattern="^act_cancel$"))
+    app.add_handler(CallbackQueryHandler(resend_otp_callback, pattern="^act_resend_otp$"))
+    app.add_handler(CallbackQueryHandler(cancel, pattern="^act_cancel.*$"))
 
     print("[+] Shahid VIP Account Creator Bot is now running...")
     app.run_polling()
