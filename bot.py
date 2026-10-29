@@ -493,10 +493,17 @@ def get_next_proxy_for_user(user_id: int) -> Optional[dict]:
         if user_proxies:
             target_entry = user_entry
             target_type = "private"
+        elif global_proxies:
+            target_entry = global_entry
+            target_type = "global"
     elif mode == "global":
         if global_proxies:
             target_entry = global_entry
             target_type = "global"
+        elif user_proxies:
+            # Fallback to user private proxies if global proxies not yet added
+            target_entry = user_entry
+            target_type = "private"
     else:  # "auto"
         if user_proxies:
             target_entry = user_entry
@@ -532,19 +539,24 @@ def get_next_proxy_for_user(user_id: int) -> Optional[dict]:
             cfg["password"] = selected_proxy.get("password", "")
         return cfg
 
-    # Fallback to PROXY_SERVER from .env if present
-    env_server = os.getenv("PROXY_SERVER")
-    if env_server:
-        return {
-            "server": env_server,
-            "host": env_server.replace("http://", "").replace("https://", ""),
-            "port": "",
-            "raw": env_server,
-            "proxy_index": 1,
-            "total_proxies": 1,
-            "proxy_type": "env",
-            "is_egypt": True,
-        }
+    # Fallback to PROXY_SERVER from .env ONLY if explicitly enabled
+    if os.getenv("USE_ENV_PROXY", "0") == "1":
+        env_server = os.getenv("PROXY_SERVER")
+        if env_server:
+            cfg = {
+                "server": env_server,
+                "host": env_server.replace("http://", "").replace("https://", ""),
+                "port": "",
+                "raw": env_server,
+                "proxy_index": 1,
+                "total_proxies": 1,
+                "proxy_type": "env",
+                "is_egypt": True,
+            }
+            if os.getenv("PROXY_USERNAME"):
+                cfg["username"] = os.getenv("PROXY_USERNAME")
+                cfg["password"] = os.getenv("PROXY_PASSWORD", "")
+            return cfg
 
     return None
 
@@ -1161,7 +1173,7 @@ async def handle_skip_onboarding(page) -> bool:
     """Actively detects and dismisses 'تخطى وابدأ المشاهدة' / interests screen."""
     await remove_cookie_banner(page)
 
-    for attempt in range(8):
+    for attempt in range(10):
         await remove_cookie_banner(page)
 
         # 1. If already on select profile screen, skip is done!
@@ -1173,53 +1185,59 @@ async def handle_skip_onboarding(page) -> bool:
             print("[+] Interests screen dismissed successfully!", flush=True)
             return True
 
-        print(f"[*] Attempt {attempt+1}/8 to click 'تخطى وابدأ المشاهدة'...", flush=True)
+        print(f"[*] Attempt {attempt+1}/10 to click 'تخطى وابدأ المشاهدة'...", flush=True)
 
-        # Scroll to bottom so skip button is in viewport
+        # Scroll to bottom so skip button is definitely in viewport
         try:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         except Exception:
             pass
 
-        # Strategy A: Direct JS leaf click on exact text containing 'تخطى' / 'تخطي'
+        # Strategy A: Direct JS click on element containing 'تخطى' / 'تخطي' / 'ابدأ المشاهدة' and bubble up
         clicked = False
         try:
             clicked = await page.evaluate("""() => {
-                const leaves = Array.from(document.querySelectorAll('*')).filter(el => {
-                    if (el.children.length > 0) return false;
-                    const t = (el.textContent || '').trim();
-                    return t.includes('تخطى') || t.includes('تخطي') || t.includes('ابدأ المشاهدة');
+                const allEls = Array.from(document.querySelectorAll('*'));
+                const skipEl = allEls.find(el => {
+                    if (el.children.length > 2) return false;
+                    const t = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
+                    return t.includes('تخطى وابدأ المشاهدة') || t.includes('تخطي وابدأ المشاهدة') ||
+                           t.includes('ابدأ المشاهدة') || t === 'تخطى' || t === 'تخطي';
                 });
-                for (const leaf of leaves) {
-                    const btn = leaf.closest('button, a, [role="button"], div[class*="cursor-pointer"]') || leaf;
-                    try {
-                        btn.scrollIntoView({ behavior: 'instant', block: 'center' });
-                        btn.click();
-                        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                        return true;
-                    } catch(e) {}
+                if (skipEl) {
+                    skipEl.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    const evt = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                    skipEl.dispatchEvent(evt);
+                    let curr = skipEl;
+                    for (let i = 0; i < 4 && curr; i++) {
+                        try { curr.click(); } catch(e) {}
+                        curr = curr.parentElement;
+                    }
+                    return true;
                 }
                 return false;
             }""")
             if clicked:
-                print("[+] Clicked skip button via DOM leaf dispatch", flush=True)
+                print("[+] Clicked skip button via DOM dispatch", flush=True)
         except Exception:
             pass
 
-        # Strategy B: Playwright locator click
+        # Strategy B: Playwright locator click with coordinate fallback
         if not clicked:
             skip_selectors = [
+                "text=/تخط[ىي]\\s*وابدأ\\s*المشاهدة/",
                 "text='تخطى وابدأ المشاهدة'",
                 "text='تخطي وابدأ المشاهدة'",
                 "text='ابدأ المشاهدة الآن'",
+                "text='ابدأ المشاهدة'",
                 "button:has-text('تخطى')",
                 "button:has-text('تخطي')",
                 "a:has-text('تخطى')",
                 "a:has-text('تخطي')",
                 "p:has-text('تخطى')",
+                "p:has-text('تخطي')",
                 "span:has-text('تخطى')",
-                "text='تخطى'",
-                "text='تخطي'",
+                "span:has-text('تخطي')",
             ]
             for s in skip_selectors:
                 try:
@@ -1227,7 +1245,12 @@ async def handle_skip_onboarding(page) -> bool:
                     if await loc.is_visible(timeout=400):
                         await loc.scroll_into_view_if_needed()
                         await asyncio.sleep(0.15)
-                        await loc.click(timeout=1500)
+                        try:
+                            await loc.click(timeout=1500)
+                        except Exception:
+                            box = await loc.bounding_box()
+                            if box:
+                                await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
                         print(f"[+] Clicked skip button using locator: {s}", flush=True)
                         clicked = True
                         break
@@ -1235,32 +1258,40 @@ async def handle_skip_onboarding(page) -> bool:
                     pass
 
         # Strategy C: Fallback - Select at least 4 categories so 'متابعة' is guaranteed enabled
-        if (attempt >= 2 or not clicked) and await is_on_interests_screen(page):
+        if (attempt >= 1 or not clicked) and await is_on_interests_screen(page):
             try:
                 print("[*] Interests fallback: selecting 4 categories and clicking 'متابعة'...", flush=True)
-                await page.evaluate("""() => {
-                    const pills = Array.from(document.querySelectorAll('div, p, span')).filter(el => {
-                        const t = (el.innerText || '').trim();
-                        return ['مسلسلات خليجية', 'أفلام أجنبية', 'مسلسلات أكشن', 'كوميديا', 'جرائم', 'أنمي'].includes(t);
-                    });
-                    let count = 0;
-                    for (const p of pills) {
-                        const target = p.closest('div[class*="cursor-pointer"]') || p.parentElement || p;
-                        try { target.click(); count++; } catch(e) {}
-                        if (count >= 4) break;
+                cat_selected = await page.evaluate("""() => {
+                    const cats = ['عروض موسيقية', 'جرائم', 'مسلسلات أكشن', 'كوميديا', 'برامج تعليمية', 'مسلسلات خليجية', 'أفلام أجنبية', 'أنمي'];
+                    let clickedCount = 0;
+                    for (const catName of cats) {
+                        const el = Array.from(document.querySelectorAll('*')).find(x => {
+                            return (x.innerText || '').trim() === catName;
+                        });
+                        if (el) {
+                            const card = el.closest('div[class*="cursor-pointer"], div[role="button"]') || el.parentElement || el;
+                            try {
+                                card.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                card.click();
+                                card.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                                clickedCount++;
+                            } catch(e) {}
+                        }
+                        if (clickedCount >= 4) break;
                     }
+                    return clickedCount >= 3;
                 }""")
-                await asyncio.sleep(0.5)
-
-                # Now click 'متابعة'
-                follow_btn = page.locator("button:has-text('متابعة')").first
-                for _ in range(4):
-                    if await follow_btn.is_visible(timeout=400) and not await follow_btn.is_disabled():
-                        await follow_btn.click()
-                        print("[+] Clicked enabled 'متابعة' button!", flush=True)
-                        clicked = True
-                        break
-                    await asyncio.sleep(0.4)
+                if cat_selected:
+                    await asyncio.sleep(0.6)
+                    # Now click 'متابعة'
+                    follow_btn = page.locator("button:has-text('متابعة'), button[type='submit']").first
+                    for _ in range(6):
+                        if await follow_btn.is_visible(timeout=400) and not await follow_btn.is_disabled():
+                            await follow_btn.click()
+                            print("[+] Clicked enabled 'متابعة' button!", flush=True)
+                            clicked = True
+                            break
+                        await asyncio.sleep(0.4)
             except Exception:
                 pass
 
@@ -1671,10 +1702,71 @@ async def fill_profile_name(page, profile_name: str, target_locator=None) -> boo
     """Robustly types and verifies the profile name in the input field, clearing any 'هذه الخانة مطلوبة' error."""
     await remove_cookie_banner(page)
     input_box = target_locator
+
     if not input_box:
-        # Strictly exclude search bar!
+        # Mark the profile name input using precise DOM analysis
+        try:
+            found = await page.evaluate("""() => {
+                // Priority 1: Find inside the profile modal/form container (has 'حساب أطفال' or 'ادخل الاسم' or 'انشاء')
+                const containers = Array.from(document.querySelectorAll('div, form, section')).filter(el => {
+                    const t = (el.innerText || '');
+                    return (t.includes('ادخل الاسم') || t.includes('أدخل الاسم') || t.includes('حساب أطفال')) &&
+                           (t.includes('اللغة') || t.includes('انشاء') || t.includes('إنشاء') || t.includes('حساب أطفال'));
+                });
+                for (const c of containers) {
+                    const inp = c.querySelector('input[type="text"], input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"])');
+                    if (inp && inp.offsetParent !== null) {
+                        inp.setAttribute('data-target-profile-input', 'true');
+                        return true;
+                    }
+                }
+
+                // Priority 2: Label or container with 'ادخل الاسم' or 'أدخل الاسم'
+                const labels = Array.from(document.querySelectorAll('label, p, span, div')).filter(el => {
+                    const t = (el.innerText || '').trim();
+                    return t === 'ادخل الاسم' || t === 'أدخل الاسم' || t === 'اسم الملف';
+                });
+                for (const l of labels) {
+                    const parent = l.closest('div.relative, div.flex, form') || l.parentElement;
+                    if (parent) {
+                        const inp = parent.querySelector('input[type="text"], input:not([type="checkbox"]):not([type="radio"])');
+                        if (inp && inp.offsetParent !== null) {
+                            inp.setAttribute('data-target-profile-input', 'true');
+                            return true;
+                        }
+                    }
+                }
+
+                // Priority 3: Specific id/placeholder matches
+                const direct = Array.from(document.querySelectorAll('input')).filter(el => {
+                    const ph = (el.placeholder || '').toLowerCase();
+                    const id = (el.id || '').toLowerCase();
+                    const name = (el.name || '').toLowerCase();
+                    if (id.includes('search') || name.includes('search') || ph.includes('ابحث') || ph.includes('بحث')) return false;
+                    if (id.includes('onetrust') || id.includes('vendor')) return false;
+                    if (el.type === 'checkbox' || el.type === 'radio' || el.type === 'hidden') return false;
+                    return el.offsetParent !== null;
+                });
+                if (direct.length > 0) {
+                    const preferred = direct.find(el => {
+                        const str = ((el.id || '') + (el.name || '') + (el.placeholder || '')).toLowerCase();
+                        return str.includes('name') || str.includes('profile') || str.includes('اسم');
+                    }) || direct[direct.length - 1];
+                    preferred.setAttribute('data-target-profile-input', 'true');
+                    return true;
+                }
+                return false;
+            }""")
+            if found:
+                input_box = page.locator("input[data-target-profile-input='true']").first
+        except Exception:
+            pass
+
+    if not input_box:
+        # Fallback selectors
         selectors = [
             "input[placeholder*='ادخل الاسم']",
+            "input[placeholder*='أدخل الاسم']",
             "input[placeholder*='الاسم']:not([placeholder*='ابحث'])",
             "input[placeholder*='اسم']:not([placeholder*='ابحث'])",
             "div[role='dialog'] input[type='text']",
@@ -1684,35 +1776,11 @@ async def fill_profile_name(page, profile_name: str, target_locator=None) -> boo
         for sel in selectors:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=1000):
+                if await loc.is_visible(timeout=500):
                     input_box = loc
                     break
             except Exception:
                 pass
-
-    if not input_box:
-        print("[!] Profile name input not found via selectors, searching visible non-search inputs...", flush=True)
-        try:
-            has_input = await page.evaluate("""() => {
-                const inputs = Array.from(document.querySelectorAll('input')).filter(el => {
-                    const rect = el.getBoundingClientRect();
-                    const ph = el.getAttribute('placeholder') || '';
-                    const id = el.getAttribute('id') || '';
-                    const name = el.getAttribute('name') || '';
-                    if (id.includes('search') || name.includes('search') || ph.includes('ابحث') || ph.includes('بحث')) return false;
-                    if (id.includes('onetrust') || id.includes('vendor')) return false;
-                    return rect.width > 50 && rect.height > 15;
-                });
-                if (inputs.length > 0) {
-                    inputs[0].setAttribute('data-target-profile-input', 'true');
-                    return true;
-                }
-                return false;
-            }""")
-            if has_input:
-                input_box = page.locator("input[data-target-profile-input='true']").first
-        except Exception:
-            pass
 
     if not input_box:
         print("[!] Profile name input could not be found!", flush=True)
@@ -1720,30 +1788,31 @@ async def fill_profile_name(page, profile_name: str, target_locator=None) -> boo
 
     try:
         await input_box.scroll_into_view_if_needed()
-        await input_box.click(timeout=2000)
+        await input_box.click(force=True)
     except Exception:
-        try:
-            await input_box.click(force=True)
-        except Exception:
-            pass
+        pass
 
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.15)
     try:
         await input_box.press("Control+A")
         await input_box.press("Backspace")
     except Exception:
         pass
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.15)
 
-    # 1. Native React input setter and event dispatch directly on input_box to ensure state sync and clear 'هذه الخانة مطلوبة'
+    # 1. Native React input setter with _valueTracker to guarantee React internal state updates
     try:
         await input_box.evaluate("""(el, val) => {
             el.focus();
+            const lastValue = el.value;
+            el.value = val;
+            const tracker = el._valueTracker;
+            if (tracker) {
+                tracker.setValue(lastValue);
+            }
             const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
             if (setter) {
                 setter.call(el, val);
-            } else {
-                el.value = val;
             }
             el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
             el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
@@ -1752,41 +1821,49 @@ async def fill_profile_name(page, profile_name: str, target_locator=None) -> boo
     except Exception:
         pass
 
-    # 2. Sequential typing and fill
+    # 2. Sequential typing into focused field to trigger keyboard listeners
     try:
-        await input_box.fill(profile_name)
+        await input_box.fill("")
+        await input_box.press_sequentially(profile_name, delay=35)
     except Exception:
         pass
 
+    # 3. Re-affirm React valueTracker and dispatch events
     try:
-        await input_box.press_sequentially(profile_name, delay=30)
+        await input_box.evaluate("""(el, val) => {
+            const lastValue = '';
+            el.value = val;
+            if (el._valueTracker) el._valueTracker.setValue(lastValue);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }""", profile_name)
     except Exception:
         pass
 
-    # 3. Trigger typing keys to finalize React form validation
-    try:
-        await input_box.press("Space")
-        await asyncio.sleep(0.05)
-        await input_box.press("Backspace")
-    except Exception:
-        pass
+    await asyncio.sleep(0.3)
 
-    await asyncio.sleep(0.5)
-
-    # 4. Verify value is set
-    try:
-        val = await input_box.input_value()
-        if val != profile_name:
-            print(f"[*] Value mismatch ('{val}' vs '{profile_name}'), forcing fill...", flush=True)
-            await input_box.fill(profile_name)
-            await input_box.evaluate("""(el, val) => {
-                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-                if (setter) setter.call(el, val); else el.value = val;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-            }""", profile_name)
-    except Exception:
-        pass
+    # 4. Clear any 'هذه الخانة مطلوبة' error if present
+    for _ in range(4):
+        err_cleared = await page.evaluate("""(val) => {
+            const errs = Array.from(document.querySelectorAll('span, p, div')).filter(el => {
+                return (el.innerText || '').includes('هذه الخانة مطلوبة') && el.offsetParent !== null;
+            });
+            if (errs.length === 0) return true;
+            const inp = document.querySelector("input[data-target-profile-input='true']") ||
+                        document.querySelector("input#profileName");
+            if (inp) {
+                inp.focus();
+                inp.value = val;
+                if (inp._valueTracker) inp._valueTracker.setValue('');
+                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+                inp.blur();
+            }
+            return false;
+        }""", profile_name)
+        if err_cleared:
+            break
+        await asyncio.sleep(0.3)
 
     print(f"[+] Successfully filled profile name: '{profile_name}'", flush=True)
     return True
@@ -1851,20 +1928,23 @@ async def create_single_profile(page: Page, profile_name: str) -> bool:
     btn_selectors = [
         "button:has-text('انشاء')",
         "button:has-text('إنشاء')",
+        "[role='button']:has-text('انشاء')",
+        "[role='button']:has-text('إنشاء')",
         "div[role='dialog'] button:has-text('انشاء')",
         "div[role='dialog'] button:has-text('إنشاء')",
         "button[type='submit']",
     ]
     created = False
-    for attempt in range(12):
+    for attempt in range(15):
         for s in btn_selectors:
             try:
                 loc = page.locator(s).last
-                if await loc.is_visible(timeout=500):
+                if await loc.is_visible(timeout=400):
                     is_dis = await loc.is_disabled()
-                    if not is_dis:
-                        print(f"[*] 'انشاء' button is enabled. Waiting 2 seconds before clicking...", flush=True)
-                        await asyncio.sleep(2.0)
+                    aria_dis = await loc.get_attribute("aria-disabled")
+                    if not is_dis and aria_dis != "true":
+                        print(f"[*] 'انشاء' button is enabled. Waiting 1.5 seconds before clicking...", flush=True)
+                        await asyncio.sleep(1.5)
                         await loc.click()
                         print(f"[+] Clicked 'انشاء' using selector: {s}", flush=True)
                         created = True
@@ -1877,10 +1957,11 @@ async def create_single_profile(page: Page, profile_name: str) -> bool:
         # Fallback: check via JS if button is enabled
         try:
             created = await page.evaluate("""() => {
-                const btns = Array.from(document.querySelectorAll('button'));
+                const btns = Array.from(document.querySelectorAll('button, [role="button"], div[class*="cursor-pointer"]'));
                 const b = btns.find(el => {
                     const t = (el.innerText || '').trim();
-                    return (t === 'انشاء' || t === 'إنشاء') && !el.disabled;
+                    const isDis = el.disabled || el.getAttribute('aria-disabled') === 'true';
+                    return (t === 'انشاء' || t === 'إنشاء') && !isDis && el.offsetParent !== null;
                 });
                 if (b) {
                     b.click();
@@ -1946,25 +2027,28 @@ async def automate_all_profiles(page: Page, status_msg, base_name: str = "dahoom
 
         if has_p1_input:
             await fill_profile_name(page, p1)
-            next_btn = page.locator("button:has-text('متابعة'), button[type='submit']").first
-            for _ in range(8):
+            next_btn = page.locator("button:has-text('متابعة'), button:has-text('انشاء'), button:has-text('إنشاء'), button[type='submit']").first
+            for _ in range(12):
                 if await next_btn.is_visible() and not await next_btn.is_disabled():
                     break
                 await asyncio.sleep(0.5)
 
-            print(f"[*] Profile 1 button is enabled. Waiting 2 seconds before clicking 'متابعة'...", flush=True)
+            print(f"[*] Profile 1 button is enabled. Waiting 2 seconds before clicking...", flush=True)
             await asyncio.sleep(2.0)
-            await next_btn.click()
+            try:
+                await next_btn.click()
+            except Exception:
+                await page.evaluate("() => { const b = document.querySelector('button[type=\"submit\"], button'); if (b) b.click(); }")
 
             for s in range(12):
                 await asyncio.sleep(1.0)
                 await remove_cookie_banner(page)
-                if not await page.locator("input#profileName").is_visible():
+                if not await page.locator("input#profileName, input[data-target-profile-input='true']").is_visible():
                     break
                 if s % 3 == 0:
                     try:
                         if await next_btn.is_visible() and not await next_btn.is_disabled():
-                            print(f"[*] Retrying Profile 1 'متابعة' click due to network lag...", flush=True)
+                            print(f"[*] Retrying Profile 1 button click due to network lag...", flush=True)
                             await next_btn.click()
                     except Exception:
                         pass
