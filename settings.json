@@ -1,8 +1,3 @@
 {
-  "perm_pass_enabled": false,
-  "perm_password": "",
-  "perm_name_enabled": false,
-  "perm_name": "",
-  "create_profiles_enabled": true,
-  "admin_contact": ""
+  "default_proxy_mode": "auto"
 }

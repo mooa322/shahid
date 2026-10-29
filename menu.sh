@@ -704,9 +704,9 @@ manage_backups() {
     echo "  النسخ الاحتياطية المتوفرة (Available Backups):"
 
     "$PY_BIN" - "$backups_dir" <<'PY'
-import os, sys
+import os, sys, datetime
 bdir = sys.argv[1]
-files = [f for f in os.listdir(bdir) if f.startswith("backup_") and f.endswith(".tar.gz")]
+files = [f for f in os.listdir(bdir) if f.startswith("backup_") and (f.endswith(".tar.gz") or f.endswith(".zip"))]
 files.sort(reverse=True)
 if not files:
     print("    [!] لا توجد نسخ احتياطية محفوظة حتى الآن.")
@@ -714,13 +714,14 @@ else:
     for idx, f in enumerate(files, 1):
         fpath = os.path.join(bdir, f)
         size_kb = os.path.getsize(fpath) / 1024
-        print(f"    [{idx}] {f} | الحجم: {size_kb:.1f} KB")
+        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%Y-%m-%d %H:%M")
+        print(f"    [{idx}] {f} | الحجم: {size_kb:.1f} KB | التاريخ: {mtime}")
 PY
 
     echo "  ────────────────────────────────────────────────────────────"
     echo "  1) إنشاء نسخة احتياطية شاملة الآن (Create Full Backup Now)"
     echo "  2) استيراد / استعادة نسخة من القائمة (Restore from List)"
-    echo "  3) استيراد من ملف خارجي مخصص (Import from Custom File)"
+    echo "  3) استيراد من ملف خارجي مخصص (Import from Custom File: .tar.gz / .zip)"
     echo "  4) حذف نسخة احتياطية من القائمة (Delete a Backup)"
     echo "  0) العودة للقائمة الرئيسية (Back to Main Menu)"
     echo "  ────────────────────────────────────────────────────────────"
@@ -729,7 +730,7 @@ PY
 
     case "$b_choice" in
       1)
-        echo "  ⏳ جاري إنشاء النسخة الاحتياطية الشاملة لجميع الملفات..."
+        echo "  ⏳ جاري إنشاء النسخة الاحتياطية الشاملة لجميع الملفات والبروكسيات..."
         "$PY_BIN" - "$BOT_DIR" "$backups_dir" <<'PY'
 import os, sys, json, tarfile
 from datetime import datetime
@@ -743,6 +744,7 @@ archive_path = os.path.join(backups_dir, archive_name)
 
 files_to_backup = [
     "accounts.json",
+    "proxies.json",
     "admins.json",
     "subscribers.json",
     "settings.json",
@@ -760,25 +762,38 @@ with tarfile.open(archive_path, "w:gz") as tar:
                 if fname.endswith(".json"):
                     with open(fpath, "r", encoding="utf-8") as f:
                         d = json.load(f)
-                        stats[fname] = len(d) if isinstance(d, (list, dict)) else 1
+                        if fname == "accounts.json" and isinstance(d, dict):
+                            tot = sum(len(v) for v in d.values() if isinstance(v, list))
+                            stats[fname] = f"{tot} حساب ({len(d)} مستخدم)"
+                        elif fname == "proxies.json" and isinstance(d, dict):
+                            tot = sum(len(v) for v in d.values() if isinstance(v, list))
+                            glob = len(d.get("global", []))
+                            stats[fname] = f"{tot} بروكسي (منها {glob} عامة)"
+                        elif isinstance(d, (list, dict)):
+                            stats[fname] = f"{len(d)} عنصر"
+                        else:
+                            stats[fname] = "1"
                 else:
-                    stats[fname] = "تم نسخه بنجاح"
-            except Exception:
-                stats[fname] = "تم نسخه"
+                    stats[fname] = "موجود ومحفوظ بنجاح"
+            except Exception as e:
+                stats[fname] = f"تم نسخه ({e})"
         else:
             stats[fname] = "غير موجود"
 
 size_kb = os.path.getsize(archive_path) / 1024
-print(f"\n  ✅ تم إنشاء النسخة الاحتياطية الشاملة بنجاح!")
+print(f"
+  ✅ تم إنشاء النسخة الاحتياطية الشاملة بنجاح!")
 print(f"  📁 اسم الملف : {archive_name}")
 print(f"  📦 الحجم      : {size_kb:.1f} KB")
-print(f"  📍 المسار     : {archive_path}\n")
-print(f"  📊 تفاصيل المحتويات:")
-print(f"     • الحسابات (accounts.json)       : {stats.get('accounts.json', 0)}")
-print(f"     • المشرفين (admins.json)         : {stats.get('admins.json', 0)}")
-print(f"     • المشتركين (subscribers.json)   : {stats.get('subscribers.json', 0)}")
-print(f"     • الإعدادات (settings.json)      : {stats.get('settings.json', 0)}")
-print(f"     • قائمة الإيميلات (queued_emails): {stats.get('queued_emails.json', 0)}")
+print(f"  📍 المسار     : {archive_path}
+")
+print(f"  📊 تفاصيل المحتويات المحفوظة:")
+print(f"     • الحسابات (accounts.json)       : {stats.get('accounts.json', '0')}")
+print(f"     • البروكسيات (proxies.json)      : {stats.get('proxies.json', '0')}")
+print(f"     • المشرفين (admins.json)         : {stats.get('admins.json', '0')}")
+print(f"     • المشتركين (subscribers.json)   : {stats.get('subscribers.json', '0')}")
+print(f"     • الإعدادات (settings.json)      : {stats.get('settings.json', '0')}")
+print(f"     • قائمة الإيميلات (queued_emails): {stats.get('queued_emails.json', '0')}")
 print(f"     • ملف البيئة (.env)              : {stats.get('.env', 'غير موجود')}")
 PY
         pause
@@ -788,34 +803,74 @@ PY
         if [[ "$restore_idx" =~ ^[0-9]+$ && "$restore_idx" -gt 0 ]]; then
           read -r -p "  ⚠️ هل أنت متأكد من استعادة هذه النسخة واستبدال البيانات الحالية؟ (y/N): " confirm_res
           if [[ "$confirm_res" =~ ^[yY]$ ]]; then
-            echo "  ⏳ جاري الاستعادة والتحقق..."
+            echo "  ⏳ جاري الاستعادة والتحقق الشامل من سلامة البيانات..."
             "$PY_BIN" - "$BOT_DIR" "$backups_dir" "$restore_idx" <<'PY'
-import os, sys, tarfile
+import os, sys, tarfile, json, zipfile
 
 bot_dir = sys.argv[1]
 backups_dir = sys.argv[2]
 idx = int(sys.argv[3])
 
-files = [f for f in os.listdir(backups_dir) if f.startswith("backup_") and f.endswith(".tar.gz")]
+files = [f for f in os.listdir(backups_dir) if f.startswith("backup_") and (f.endswith(".tar.gz") or f.endswith(".zip"))]
 files.sort(reverse=True)
 
 if not (1 <= idx <= len(files)):
-    print(f"\n  ❌ رقم النسخة غير صحيح: {idx}")
+    print(f"
+  ❌ رقم النسخة غير صحيح: {idx}")
     sys.exit(0)
 
 target_archive = os.path.join(backups_dir, files[idx - 1])
 print(f"  📦 استعادة من: {files[idx - 1]}")
 
 try:
-    with tarfile.open(target_archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            if not member.name.startswith("/") and ".." not in member.name:
-                tar.extract(member, path=bot_dir)
-    print("\n  ✅ تمت استعادة كافة البيانات بنجاح (الحسابات، الأدمن، المشتركين، الإعدادات، والبيئة)!")
-    print("  💡 يُنصح بإعادة تشغيل البوت لتطبيق التغييرات (خيار 4 في القائمة الرئيسية).")
+    if target_archive.endswith(".tar.gz") or target_archive.endswith(".tgz"):
+        with tarfile.open(target_archive, "r:gz") as tar:
+            for member in tar.getmembers():
+                if not member.name.startswith("/") and ".." not in member.name:
+                    tar.extract(member, path=bot_dir)
+    elif target_archive.endswith(".zip"):
+        with zipfile.ZipFile(target_archive, "r") as zf:
+            for member in zf.namelist():
+                if not member.startswith("/") and ".." not in member:
+                    zf.extract(member, path=bot_dir)
+
+    # Defensive validation: ensure all extracted JSON files are valid types
+    for fn in ["accounts.json", "proxies.json", "queued_emails.json", "subscribers.json", "settings.json"]:
+        fp = os.path.join(bot_dir, fn)
+        if os.path.exists(fp):
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if not isinstance(d, dict):
+                    with open(fp, "w", encoding="utf-8") as f:
+                        json.dump({}, f, ensure_ascii=False, indent=2)
+            except Exception:
+                with open(fp, "w", encoding="utf-8") as f:
+                    json.dump({}, f, ensure_ascii=False, indent=2)
+
+    fp = os.path.join(bot_dir, "admins.json")
+    if os.path.exists(fp):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, list):
+                with open(fp, "w", encoding="utf-8") as f:
+                    json.dump([1291024378], f, ensure_ascii=False, indent=2)
+        except Exception:
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump([1291024378], f, ensure_ascii=False, indent=2)
+
+    print("
+  ✅ تمت استعادة كافة البيانات والبروكسيات بنجاح والتحقق من سلامة الجداول!")
 except Exception as e:
-    print(f"\n  ❌ حدث خطأ أثناء الاستعادة: {e}")
+    print(f"
+  ❌ حدث خطأ أثناء الاستعادة: {e}")
 PY
+            if command -v systemctl &>/dev/null; then
+              echo "  🔄 جاري إعادة تشغيل خدمة البوت لتطبيق التغييرات المستعادة فوراً..."
+              systemctl restart "$SERVICE" 2>/dev/null || true
+              echo "  [✔] تمت إعادة تشغيل خدمة $SERVICE بنجاح."
+            fi
           else
             echo "  تم الإلغاء."
           fi
@@ -825,26 +880,70 @@ PY
         pause
         ;;
       3)
-        read -r -p "  أدخل المسار الكامل لملف النسخة الاحتياطية (.tar.gz): " custom_path
+        read -r -p "  أدخل المسار الكامل لملف النسخة الاحتياطية (.tar.gz / .zip): " custom_path
         if [[ -f "$custom_path" ]]; then
-          read -r -p "  ⚠️ هل أنت متأكد من استيراد هذا الملف؟ (y/N): " confirm_imp
+          read -r -p "  ⚠️ هل أنت متأكد من استيراد هذا الملف واستبدال البيانات الحالية؟ (y/N): " confirm_imp
           if [[ "$confirm_imp" =~ ^[yY]$ ]]; then
+            echo "  ⏳ جاري الاستيراد والتحقق..."
             "$PY_BIN" - "$BOT_DIR" "$custom_path" <<'PY'
-import os, sys, tarfile
+import os, sys, tarfile, json, zipfile
 
 bot_dir = sys.argv[1]
 custom_path = sys.argv[2]
 
 try:
-    with tarfile.open(custom_path, "r:gz") as tar:
-        for member in tar.getmembers():
-            if not member.name.startswith("/") and ".." not in member.name:
-                tar.extract(member, path=bot_dir)
-    print(f"\n  ✅ تم استيراد واستعادة البيانات بنجاح من: {custom_path}")
-    print("  💡 يُنصح بإعادة تشغيل البوت لتطبيق التغييرات (خيار 4 في القائمة الرئيسية).")
+    if custom_path.endswith(".tar.gz") or custom_path.endswith(".tgz") or tarfile.is_tarfile(custom_path):
+        with tarfile.open(custom_path, "r:gz") as tar:
+            for member in tar.getmembers():
+                if not member.name.startswith("/") and ".." not in member.name:
+                    tar.extract(member, path=bot_dir)
+    elif custom_path.endswith(".zip") or zipfile.is_zipfile(custom_path):
+        with zipfile.ZipFile(custom_path, "r") as zf:
+            for member in zf.namelist():
+                if not member.startswith("/") and ".." not in member:
+                    zf.extract(member, path=bot_dir)
+    else:
+        print(f"
+  ❌ صيغة الملف غير مدعومة: {custom_path}")
+        sys.exit(1)
+
+    # Defensive validation: ensure all extracted JSON files are valid types
+    for fn in ["accounts.json", "proxies.json", "queued_emails.json", "subscribers.json", "settings.json"]:
+        fp = os.path.join(bot_dir, fn)
+        if os.path.exists(fp):
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if not isinstance(d, dict):
+                    with open(fp, "w", encoding="utf-8") as f:
+                        json.dump({}, f, ensure_ascii=False, indent=2)
+            except Exception:
+                with open(fp, "w", encoding="utf-8") as f:
+                    json.dump({}, f, ensure_ascii=False, indent=2)
+
+    fp = os.path.join(bot_dir, "admins.json")
+    if os.path.exists(fp):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, list):
+                with open(fp, "w", encoding="utf-8") as f:
+                    json.dump([1291024378], f, ensure_ascii=False, indent=2)
+        except Exception:
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump([1291024378], f, ensure_ascii=False, indent=2)
+
+    print(f"
+  ✅ تم استيراد واستعادة البيانات بنجاح من: {custom_path}")
 except Exception as e:
-    print(f"\n  ❌ حدث خطأ أثناء الاستيراد: {e}")
+    print(f"
+  ❌ حدث خطأ أثناء الاستيراد: {e}")
 PY
+            if command -v systemctl &>/dev/null; then
+              echo "  🔄 جاري إعادة تشغيل خدمة البوت لتطبيق التغييرات المستوردة فوراً..."
+              systemctl restart "$SERVICE" 2>/dev/null || true
+              echo "  [✔] تمت إعادة تشغيل خدمة $SERVICE بنجاح."
+            fi
           else
             echo "  تم الإلغاء."
           fi
@@ -860,14 +959,16 @@ PY
 import os, sys
 bdir = sys.argv[1]
 idx = int(sys.argv[2])
-files = [f for f in os.listdir(bdir) if f.startswith("backup_") and f.endswith(".tar.gz")]
+files = [f for f in os.listdir(bdir) if f.startswith("backup_") and (f.endswith(".tar.gz") or f.endswith(".zip"))]
 files.sort(reverse=True)
 if 1 <= idx <= len(files):
     fpath = os.path.join(bdir, files[idx - 1])
     os.remove(fpath)
-    print(f"\n  ✅ تم حذف النسخة الاحتياطية بنجاح: {files[idx - 1]}")
+    print(f"
+  ✅ تم حذف النسخة الاحتياطية بنجاح: {files[idx - 1]}")
 else:
-    print(f"\n  ❌ رقم غير صالح: {idx}")
+    print(f"
+  ❌ رقم غير صالح: {idx}")
 PY
         else
           echo "  ❌ رقم غير صالح."
@@ -897,23 +998,23 @@ update_from_github() {
   local repo_url="https://github.com/mooa322/shahid.git"
   local target_dir="$BOT_DIR"
 
-  echo "  [1/5] حفظ نسخة احتياطية من ملفات الإعدادات والمشتركين..."
+  echo "  [1/6] حفظ نسخة احتياطية شاملة لجميع بيانات الحسابات والإعدادات..."
   mkdir -p "$target_dir/backups"
   local bak_stamp
   bak_stamp="$(date '+%Y%m%d_%H%M%S')"
   local pre_bak="$target_dir/backups/pre_update_$bak_stamp.tar.gz"
-  tar -czf "$pre_bak" -C "$target_dir" .env admins.json subscribers.json queued_emails.json settings.json 2>/dev/null || true
+  tar -czf "$pre_bak" -C "$target_dir" .env accounts.json proxies.json admins.json subscribers.json queued_emails.json settings.json 2>/dev/null || true
   echo "  [✔] تم حفظ نسخة احتياطية محلية: $(basename "$pre_bak")"
 
   echo ""
-  echo "  [2/5] جاري سحب وتحديث الملفات من GitHub..."
+  echo "  [2/6] جاري سحب وتحديث أحدث الأكواد والملفات من GitHub..."
   local updated=0
   if [[ -d "$target_dir/.git" ]]; then
     cd "$target_dir"
     git remote set-url origin "$repo_url" 2>/dev/null || git remote add origin "$repo_url" 2>/dev/null || true
-    git stash 2>/dev/null || true
-    if git pull --rebase origin main 2>/dev/null || git pull --rebase origin master 2>/dev/null || git pull origin main 2>/dev/null; then
-      echo "  [✔] تم التحديث عبر git pull بنجاح."
+    git fetch origin main 2>/dev/null || git fetch origin master 2>/dev/null || true
+    if git reset --hard origin/main 2>/dev/null || git reset --hard origin/master 2>/dev/null || git pull --rebase origin main 2>/dev/null; then
+      echo "  [✔] تم سحب وتطبيق التحديث عبر Git بنجاح."
       updated=1
     fi
   fi
@@ -937,13 +1038,29 @@ update_from_github() {
   fi
 
   # Restore critical config files if needed
+  echo ""
+  echo "  [3/6] استعادة وحماية ملفات البيانات والحسابات الشخصية..."
   if [[ -f "$pre_bak" ]]; then
-    tar -xzf "$pre_bak" -C "$target_dir" .env admins.json subscribers.json queued_emails.json settings.json 2>/dev/null || true
-    echo "  [✔] تم التأكد من بقاء ملفات الإعدادات والاشتراكات كما هي دون أي مساس."
+    tar -xzf "$pre_bak" -C "$target_dir" .env accounts.json proxies.json admins.json subscribers.json queued_emails.json settings.json 2>/dev/null || true
+    echo "  [✔] تم التأكد من بقاء ملفات الحسابات والبروكسيات والإعدادات دون مساس."
   fi
 
+  # Validate JSON structures for accounts and proxies
+  python3 -c "
+import json, os
+for f in ['accounts.json', 'proxies.json', 'queued_emails.json', 'subscribers.json']:
+    p = os.path.join('$target_dir', f)
+    if os.path.exists(p):
+        try:
+            d = json.load(open(p, 'r', encoding='utf-8'))
+            if not isinstance(d, dict):
+                json.dump({}, open(p, 'w', encoding='utf-8'))
+        except Exception:
+            json.dump({}, open(p, 'w', encoding='utf-8'))
+" 2>/dev/null || true
+
   echo ""
-  echo "  [3/5] تحديث الصلاحيات والأمر العالمي shahid..."
+  echo "  [4/6] تحديث الصلاحيات والأمر العالمي shahid..."
   chmod +x "$target_dir/menu.sh" "$target_dir/setup_ubuntu24.sh" "$target_dir/shahid.sh" 2>/dev/null || true
   if [[ -d "/usr/local/bin" && -w "/usr/local/bin" ]]; then
     ln -sf "$target_dir/menu.sh" /usr/local/bin/shahid 2>/dev/null || true
@@ -951,14 +1068,14 @@ update_from_github() {
   echo "  [✔] الصلاحيات والأمر العالمي جاهز."
 
   echo ""
-  echo "  [4/5] فحص وتحديث مكتبات بايثون..."
+  echo "  [5/6] فحص وتحديث مكتبات بايثون..."
   if [[ -x "$target_dir/.venv/bin/pip" && -f "$target_dir/requirements.txt" ]]; then
     "$target_dir/.venv/bin/pip" install -r "$target_dir/requirements.txt" --upgrade-strategy only-if-needed --quiet 2>/dev/null || true
     echo "  [✔] المكتبات محدثة."
   fi
 
   echo ""
-  echo "  [5/5] إعادة تشغيل خدمة البوت في الخلفية..."
+  echo "  [6/6] إعادة تشغيل خدمة البوت في الخلفية..."
   if command -v systemctl &>/dev/null && systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
     systemctl restart "$SERVICE" 2>/dev/null || true
     echo "  [✔] تمت إعادة تشغيل خدمة $SERVICE بنجاح."

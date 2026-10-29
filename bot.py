@@ -332,33 +332,67 @@ def parse_proxies_text(raw_text: str) -> List[dict]:
 def get_user_proxy_info(user_id: int) -> dict:
     data = load_proxies()
     uid = str(user_id)
-    if uid in data and data[uid].get("proxies"):
-        return data[uid]
-    if "global" in data and data["global"].get("proxies"):
-        return data["global"]
-    return {"proxies": [], "current_index": 0, "rotation_enabled": True}
+    return data.get(uid, {"proxies": [], "current_index": 0, "rotation_enabled": True, "proxy_mode": "auto"})
+
+
+def get_global_proxy_info() -> dict:
+    data = load_proxies()
+    return data.get("global", {"proxies": [], "current_index": 0, "rotation_enabled": True})
 
 
 def get_user_proxies(user_id: int) -> List[dict]:
     return get_user_proxy_info(user_id).get("proxies", [])
 
 
-def add_user_proxies(user_id: int, new_proxies: List[dict], replace: bool = False) -> tuple[int, int, int]:
+def get_global_proxies() -> List[dict]:
+    return get_global_proxy_info().get("proxies", [])
+
+
+def get_user_proxy_mode(user_id: int) -> str:
+    """Returns 'auto' (use private then global), 'private' (private only), or 'global' (global shared only)."""
+    return get_user_proxy_info(user_id).get("proxy_mode", "auto")
+
+
+def cycle_user_proxy_mode(user_id: int) -> str:
+    """Cycles mode: auto -> private -> global -> auto."""
     data = load_proxies()
     uid = str(user_id)
-    user_entry = data.setdefault(uid, {
+    entry = data.setdefault(uid, {
+        "proxies": [],
+        "current_index": 0,
+        "rotation_enabled": True,
+        "proxy_mode": "auto",
+    })
+    current = entry.get("proxy_mode", "auto")
+    next_modes = {
+        "auto": "private",
+        "private": "global",
+        "global": "auto",
+    }
+    new_mode = next_modes.get(current, "auto")
+    entry["proxy_mode"] = new_mode
+    save_proxies(data)
+    return new_mode
+
+
+def add_proxies_to_target(target_key: str, new_proxies: List[dict], replace: bool = False) -> tuple[int, int, int]:
+    """Adds proxies to either a user ID string or 'global'."""
+    data = load_proxies()
+    entry = data.setdefault(target_key, {
         "proxies": [],
         "current_index": 0,
         "rotation_enabled": True,
     })
+    if target_key != "global" and "proxy_mode" not in entry:
+        entry["proxy_mode"] = "auto"
 
     if replace:
-        user_entry["proxies"] = new_proxies
-        user_entry["current_index"] = 0
+        entry["proxies"] = new_proxies
+        entry["current_index"] = 0
         save_proxies(data)
         return len(new_proxies), 0, len(new_proxies)
 
-    current_proxies = user_entry.get("proxies", [])
+    current_proxies = entry.get("proxies", [])
     seen = {f"{p.get('host')}:{p.get('port')}" for p in current_proxies}
     added = 0
     duplicates = 0
@@ -372,9 +406,17 @@ def add_user_proxies(user_id: int, new_proxies: List[dict], replace: bool = Fals
         seen.add(key)
         added += 1
 
-    user_entry["proxies"] = current_proxies
+    entry["proxies"] = current_proxies
     save_proxies(data)
     return added, duplicates, len(current_proxies)
+
+
+def add_user_proxies(user_id: int, new_proxies: List[dict], replace: bool = False) -> tuple[int, int, int]:
+    return add_proxies_to_target(str(user_id), new_proxies, replace=replace)
+
+
+def add_global_proxies(new_proxies: List[dict], replace: bool = False) -> tuple[int, int, int]:
+    return add_proxies_to_target("global", new_proxies, replace=replace)
 
 
 def clear_user_proxies(user_id: int) -> bool:
@@ -388,16 +430,40 @@ def clear_user_proxies(user_id: int) -> bool:
     return False
 
 
+def clear_global_proxies() -> bool:
+    data = load_proxies()
+    if "global" in data:
+        data["global"]["proxies"] = []
+        data["global"]["current_index"] = 0
+        save_proxies(data)
+        return True
+    return False
+
+
 def toggle_user_proxy_rotation(user_id: int) -> bool:
     data = load_proxies()
     uid = str(user_id)
-    user_entry = data.setdefault(uid, {
+    entry = data.setdefault(uid, {
+        "proxies": [],
+        "current_index": 0,
+        "rotation_enabled": True,
+        "proxy_mode": "auto",
+    })
+    new_state = not entry.get("rotation_enabled", True)
+    entry["rotation_enabled"] = new_state
+    save_proxies(data)
+    return new_state
+
+
+def toggle_global_proxy_rotation() -> bool:
+    data = load_proxies()
+    entry = data.setdefault("global", {
         "proxies": [],
         "current_index": 0,
         "rotation_enabled": True,
     })
-    new_state = not user_entry.get("rotation_enabled", True)
-    user_entry["rotation_enabled"] = new_state
+    new_state = not entry.get("rotation_enabled", True)
+    entry["rotation_enabled"] = new_state
     save_proxies(data)
     return new_state
 
@@ -405,12 +471,31 @@ def toggle_user_proxy_rotation(user_id: int) -> bool:
 def get_next_proxy_for_user(user_id: int) -> Optional[dict]:
     data = load_proxies()
     uid = str(user_id)
+    user_entry = data.get(uid, {})
+    global_entry = data.get("global", {})
+    mode = user_entry.get("proxy_mode", "auto")
+
+    user_proxies = user_entry.get("proxies", [])
+    global_proxies = global_entry.get("proxies", [])
 
     target_entry = None
-    if uid in data and data[uid].get("proxies"):
-        target_entry = data[uid]
-    elif "global" in data and data["global"].get("proxies"):
-        target_entry = data["global"]
+    target_type = "private"
+
+    if mode == "private":
+        if user_proxies:
+            target_entry = user_entry
+            target_type = "private"
+    elif mode == "global":
+        if global_proxies:
+            target_entry = global_entry
+            target_type = "global"
+    else:  # "auto"
+        if user_proxies:
+            target_entry = user_entry
+            target_type = "private"
+        elif global_proxies:
+            target_entry = global_entry
+            target_type = "global"
 
     if target_entry and target_entry.get("proxies"):
         proxies_list = target_entry["proxies"]
@@ -431,6 +516,7 @@ def get_next_proxy_for_user(user_id: int) -> Optional[dict]:
             "raw": selected_proxy.get("raw", ""),
             "proxy_index": (cur_idx % total) + 1,
             "total_proxies": total,
+            "proxy_type": target_type,
             "is_egypt": selected_proxy.get("is_egypt", True),
         }
         if selected_proxy.get("username"):
@@ -438,25 +524,21 @@ def get_next_proxy_for_user(user_id: int) -> Optional[dict]:
             cfg["password"] = selected_proxy.get("password", "")
         return cfg
 
-    # Fallback to .env proxy
+    # Fallback to PROXY_SERVER from .env if present
     env_server = os.getenv("PROXY_SERVER")
     if env_server:
-        host = env_server.replace("http://", "").replace("https://", "").split(":")[0]
-        cfg = {
+        return {
             "server": env_server,
-            "host": host,
+            "host": env_server.replace("http://", "").replace("https://", ""),
+            "port": "",
             "raw": env_server,
             "proxy_index": 1,
             "total_proxies": 1,
-            "is_egypt": "eg" in env_server.lower() or "eg" in os.getenv("PROXY_USERNAME", "").lower(),
+            "proxy_type": "env",
+            "is_egypt": True,
         }
-        if os.getenv("PROXY_USERNAME"):
-            cfg["username"] = os.getenv("PROXY_USERNAME")
-            cfg["password"] = os.getenv("PROXY_PASSWORD", "")
-        return cfg
 
     return None
-
 
 def add_or_renew_subscriber(user_id: int, days: int, note: str = "", created_by: int = 0) -> dict:
     data = load_subscribers()
@@ -607,6 +689,8 @@ async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     raise ApplicationHandlerStop
 
 
+
+
 def load_settings() -> dict:
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -731,7 +815,10 @@ def load_accounts() -> dict:
     if os.path.exists(ACCOUNTS_FILE):
         try:
             with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                d = json.load(f)
+                if isinstance(d, dict):
+                    return d
+                return {}
         except Exception:
             return {}
     return {}
@@ -739,8 +826,10 @@ def load_accounts() -> dict:
 
 def save_account(user_id: int, email: str, password: str, profiles: list, proxy: str = "") -> None:
     data = load_accounts()
+    if not isinstance(data, dict):
+        data = {}
     uid = str(user_id)
-    if uid not in data:
+    if uid not in data or not isinstance(data[uid], list):
         data[uid] = []
     account_entry = {
         "email": email,
@@ -821,6 +910,9 @@ def get_main_inline_keyboard(user_id: int = 0) -> InlineKeyboardMarkup:
         buttons.append([
             InlineKeyboardButton("👥 المشتركين", callback_data="act_subs"),
             InlineKeyboardButton("📞 حساب التواصل", callback_data="act_admin_contact"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("💾 نسخة احتياطية شاملة", callback_data="act_admin_backup"),
         ])
     else:
         buttons.append([
@@ -1039,14 +1131,17 @@ async def remove_cookie_banner(page: Page) -> bool:
 
 
 async def is_on_interests_screen(page) -> bool:
-    """Detects if page is currently on the onboarding interests selection screen."""
+    """Detects if page is currently on the onboarding interests/genres selection screen."""
     try:
-        body_t = await page.locator("body").inner_text()
-        has_skip_text = any(x in body_t for x in ["تخطى وابدأ المشاهدة", "تخطي وابدأ المشاهدة", "ابدأ المشاهدة", "تخطي الخطوة"])
-        has_interests_text = any(x in body_t for x in ["عروض موسيقية", "مسلسلات أكشن", "أفلام أجنبية", "كوميديا", "جرائم", "مسلسلات خليجية"])
-        if has_skip_text or has_interests_text:
+        cur_url = (page.url or "").lower()
+        if "/onboarding" in cur_url or "/interests" in cur_url:
             return True
-        if "/onboarding" in page.url or "/interests" in page.url:
+        body_t = await page.locator("body").inner_text()
+        has_skip_text = any(x in body_t for x in ["تخطى وابدأ المشاهدة", "تخطي وابدأ المشاهدة", "ابدأ المشاهدة", "تخطي الخطوة", "تخطى", "تخطي"])
+        has_interests_text = any(x in body_t for x in ["عروض موسيقية", "مسلسلات أكشن", "أفلام أجنبية", "كوميديا", "جرائم", "مسلسلات خليجية", "برامج تعليمية", "أنمي"])
+        if has_interests_text:
+            return True
+        if has_skip_text and ("متابعة" in body_t or "اختر" in body_t):
             return True
     except Exception:
         pass
@@ -1054,7 +1149,7 @@ async def is_on_interests_screen(page) -> bool:
 
 
 async def handle_skip_onboarding(page) -> bool:
-    """Actively detects and clicks 'تخطى وابدأ المشاهدة' with resilient polling and verification until dismissed."""
+    """Actively detects and dismisses 'تخطى وابدأ المشاهدة' / interests screen."""
     await remove_cookie_banner(page)
 
     for attempt in range(8):
@@ -1077,99 +1172,95 @@ async def handle_skip_onboarding(page) -> bool:
         except Exception:
             pass
 
+        # Strategy A: Direct JS leaf click on exact text containing 'تخطى' / 'تخطي'
         clicked = False
-        skip_selectors = [
-            r"text=/تخط[ىي]\s*وابد[أا]\s*المشاهد/",
-            "text='تخطى وابدأ المشاهدة'",
-            "text='تخطي وابدأ المشاهدة'",
-            "button:has-text('تخطى')",
-            "button:has-text('تخطي')",
-            "a:has-text('تخطى')",
-            "a:has-text('تخطي')",
-            "p:has-text('تخطى')",
-            "span:has-text('تخطى')",
-            "text='تخطى'",
-            "text='تخطي'",
-        ]
-
-        for s in skip_selectors:
-            try:
-                loc = page.locator(s).first
-                if await loc.is_visible(timeout=500):
-                    await loc.scroll_into_view_if_needed()
-                    await asyncio.sleep(0.2)
-                    await loc.click(timeout=2500)
-                    print(f"[+] Clicked skip button using locator: {s}", flush=True)
-                    clicked = True
-                    break
-            except Exception:
-                pass
-
-        if not clicked:
-            try:
-                loc = page.locator("text=/تخط[ىي]/").first
-                if await loc.is_visible(timeout=500):
-                    box = await loc.bounding_box()
-                    if box:
-                        await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                        print("[+] Clicked skip via mouse coordinates", flush=True)
-                        clicked = True
-            except Exception:
-                pass
-
         try:
-            js_clicked = await page.evaluate("""() => {
-                const all = Array.from(document.querySelectorAll('button, a, p, span, div'));
-                const el = all.find(e => {
-                    const t = (e.innerText || '').trim();
-                    return (t.includes('تخطى') || t.includes('تخطي')) && (t.includes('مشاهد') || t.includes('ابدأ') || t.includes('ابدا') || t.length < 25);
+            clicked = await page.evaluate("""() => {
+                const leaves = Array.from(document.querySelectorAll('*')).filter(el => {
+                    if (el.children.length > 0) return false;
+                    const t = (el.textContent || '').trim();
+                    return t.includes('تخطى') || t.includes('تخطي') || t.includes('ابدأ المشاهدة');
                 });
-                if (el) {
-                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    el.click();
-                    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-                    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-                    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                    let p = el.parentElement;
-                    for (let i = 0; i < 4 && p; i++) {
-                        p.click();
-                        p.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                        p = p.parentElement;
-                    }
-                    return true;
+                for (const leaf of leaves) {
+                    const btn = leaf.closest('button, a, [role="button"], div[class*="cursor-pointer"]') || leaf;
+                    try {
+                        btn.scrollIntoView({ behavior: 'instant', block: 'center' });
+                        btn.click();
+                        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        return true;
+                    } catch(e) {}
                 }
                 return false;
             }""")
-            if js_clicked:
-                clicked = True
+            if clicked:
+                print("[+] Clicked skip button via DOM leaf dispatch", flush=True)
         except Exception:
             pass
 
-        # Fallback Strategy: If clicking 'تخطى' didn't dismiss after attempt 2, select categories & click 'متابعة'
-        if attempt >= 2 and await is_on_interests_screen(page):
-            try:
-                print("[*] Interests fallback: selecting categories and clicking 'متابعة'...", flush=True)
-                pills = [
-                    "text='أفلام أجنبية'",
-                    "text='مسلسلات خليجية'",
-                    "text='مسلسلات أكشن'",
-                    "text='كوميديا'",
-                    "text='جرائم'",
-                    "text='أنمي'",
-                ]
-                for p_sel in pills[:2]:
-                    try:
-                        p_loc = page.locator(p_sel).first
-                        if await p_loc.is_visible(timeout=400):
-                            await p_loc.click(force=True)
-                            await asyncio.sleep(0.3)
-                    except Exception:
-                        pass
+        # Strategy B: Playwright locator click
+        if not clicked:
+            skip_selectors = [
+                "text='تخطى وابدأ المشاهدة'",
+                "text='تخطي وابدأ المشاهدة'",
+                "text='ابدأ المشاهدة الآن'",
+                "button:has-text('تخطى')",
+                "button:has-text('تخطي')",
+                "a:has-text('تخطى')",
+                "a:has-text('تخطي')",
+                "p:has-text('تخطى')",
+                "span:has-text('تخطى')",
+                "text='تخطى'",
+                "text='تخطي'",
+            ]
+            for s in skip_selectors:
+                try:
+                    loc = page.locator(s).last
+                    if await loc.is_visible(timeout=400):
+                        await loc.scroll_into_view_if_needed()
+                        await asyncio.sleep(0.15)
+                        await loc.click(timeout=1500)
+                        print(f"[+] Clicked skip button using locator: {s}", flush=True)
+                        clicked = True
+                        break
+                except Exception:
+                    pass
 
-                btn_follow = page.locator("button:has-text('متابعة')").first
-                if await btn_follow.is_visible(timeout=600) and not await btn_follow.is_disabled():
-                    await btn_follow.click(force=True)
-                    print("[+] Clicked 'متابعة' after selecting categories!", flush=True)
+        # Strategy C: Fallback - Select at least 4 categories so 'متابعة' is guaranteed enabled
+        if (attempt >= 2 or not clicked) and await is_on_interests_screen(page):
+            try:
+                print("[*] Interests fallback: selecting 4 categories and clicking 'متابعة'...", flush=True)
+                await page.evaluate("""() => {
+                    const pills = Array.from(document.querySelectorAll('div, p, span')).filter(el => {
+                        const t = (el.innerText || '').trim();
+                        return ['مسلسلات خليجية', 'أفلام أجنبية', 'مسلسلات أكشن', 'كوميديا', 'جرائم', 'أنمي'].includes(t);
+                    });
+                    let count = 0;
+                    for (const p of pills) {
+                        const target = p.closest('div[class*="cursor-pointer"]') || p.parentElement || p;
+                        try { target.click(); count++; } catch(e) {}
+                        if (count >= 4) break;
+                    }
+                }""")
+                await asyncio.sleep(0.5)
+
+                # Now click 'متابعة'
+                follow_btn = page.locator("button:has-text('متابعة')").first
+                for _ in range(4):
+                    if await follow_btn.is_visible(timeout=400) and not await follow_btn.is_disabled():
+                        await follow_btn.click()
+                        print("[+] Clicked enabled 'متابعة' button!", flush=True)
+                        clicked = True
+                        break
+                    await asyncio.sleep(0.4)
+            except Exception:
+                pass
+
+        # Strategy D: If still stuck on interests screen after attempt 4, navigate directly to profile screen
+        if attempt >= 4 and await is_on_interests_screen(page):
+            try:
+                print("[*] Navigating directly to /ar/hub/profile to bypass stuck interests screen...", flush=True)
+                await page.goto("https://shahid.mbc.net/ar/hub/profile", wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(2.0)
             except Exception:
                 pass
 
@@ -1193,11 +1284,14 @@ handle_skip = handle_skip_onboarding
 async def is_on_select_profile_screen(page: Page) -> bool:
     """Checks if we are currently on the 'اختر من يشاهد الآن' profile selection screen."""
     try:
-        plus_sel = "[data-testid='SelectProfilePage_profile-plus-icon'], [data-test='plus'], img[alt='اضف ملف']"
+        cur_url = (page.url or "").lower()
+        if "/hub/profile" in cur_url or "/select-profile" in cur_url:
+            return True
+        plus_sel = "[data-testid='SelectProfilePage_profile-plus-icon'], [data-test='plus'], img[alt='اضف ملف'], div:has-text('إضافة'):has(img)"
         if await page.locator(plus_sel).first.is_visible(timeout=300):
             return True
         body_t = await page.locator("body").inner_text()
-        if any(x in body_t for x in ["اختر من يشاهد", "من يشاهد؟", "Select Profile"]):
+        if any(x in body_t for x in ["اختر من يشاهد", "من يشاهد؟", "Select Profile", "إدارة الملفات"]):
             return True
     except Exception:
         pass
@@ -1297,8 +1391,7 @@ async def open_avatar_dropdown(page: Page) -> bool:
 
 
 async def click_change_profile_span(page: Page) -> bool:
-    """Waits patiently for 'تغير الملف الشخصي' to appear in the dropdown menu and clicks it cleanly.
-    Clicks the exact underlined text span, never clicks 'تعديل المعلومات الشخصية' or other menu options."""
+    """Waits patiently for 'تغير الملف الشخصي' to appear in the dropdown menu and clicks it cleanly."""
     print("[*] Waiting for 'تغير الملف الشخصي' to appear in dropdown...", flush=True)
 
     selectors = [
@@ -1312,7 +1405,6 @@ async def click_change_profile_span(page: Page) -> bool:
     ]
 
     target_loc = None
-    # Wait patiently for up to 15 seconds without closing/re-toggling the menu
     for attempt in range(15):
         for s in selectors:
             try:
@@ -1330,8 +1422,8 @@ async def click_change_profile_span(page: Page) -> bool:
 
         try:
             found = await page.evaluate("""() => {
-                const span = document.querySelector('[data-testid=\"selectedProfileDetails_change-profile\"] span.underline') ||
-                             document.querySelector('[data-testid=\"selectedProfileDetails_change-profile\"] span:last-child') ||
+                const span = document.querySelector('[data-testid="selectedProfileDetails_change-profile"] span.underline') ||
+                             document.querySelector('[data-testid="selectedProfileDetails_change-profile"] span:last-child') ||
                              Array.from(document.querySelectorAll('span')).find(s => {
                                  const t = (s.innerText || '').trim();
                                  return (t === 'تغير الملف الشخصي' || t === 'تغيير الملف الشخصي') && !t.includes('تعديل');
@@ -1350,7 +1442,6 @@ async def click_change_profile_span(page: Page) -> bool:
         print("[!] 'تغير الملف الشخصي' did not appear within 15 seconds.", flush=True)
         return False
 
-    # Wait 1.0 second after appearance
     await asyncio.sleep(1.0)
 
     print("[*] Clicking 'تغير الملف الشخصي'...", flush=True)
@@ -1367,8 +1458,8 @@ async def click_change_profile_span(page: Page) -> bool:
 
     try:
         js_clicked = await page.evaluate("""() => {
-            const span = document.querySelector('[data-testid=\"selectedProfileDetails_change-profile\"] span.underline') ||
-                         document.querySelector('[data-testid=\"selectedProfileDetails_change-profile\"] span:last-child') ||
+            const span = document.querySelector('[data-testid="selectedProfileDetails_change-profile"] span.underline') ||
+                         document.querySelector('[data-testid="selectedProfileDetails_change-profile"] span:last-child') ||
                          Array.from(document.querySelectorAll('span')).find(s => {
                              const t = (s.innerText || '').trim();
                              return (t === 'تغير الملف الشخصي' || t === 'تغيير الملف الشخصي') && !t.includes('تعديل');
@@ -1376,7 +1467,7 @@ async def click_change_profile_span(page: Page) -> bool:
             if (span) {
                 span.click();
                 span.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                const parent = span.closest('[data-testid=\"selectedProfileDetails_change-profile\"]');
+                const parent = span.closest('[data-testid="selectedProfileDetails_change-profile"]');
                 if (parent) {
                     parent.click();
                     parent.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
@@ -1395,34 +1486,31 @@ async def click_change_profile_span(page: Page) -> bool:
 
 
 async def navigate_to_select_profile_screen(page: Page) -> bool:
-    """Navigates to the profile selection screen ONLY via the user's required UI flow:
-    1. Wait for top avatar -> click it.
-    2. Wait for 'تغير الملف الشخصي' -> click it.
-    3. Wait for profile selection screen / plus icon.
-    No direct URL navigation fallback."""
+    """Navigates to the profile selection screen."""
     await remove_cookie_banner(page)
 
-    # 1. Check if ALREADY on profile selection screen (poll for up to 8s)
-    # If still on interests screen, dismiss it first!
+    # 1. Check if already on profile selection screen
+    if await is_on_select_profile_screen(page):
+        print("[+] Already on profile selection screen!", flush=True)
+        return True
+
+    # If on interests screen, dismiss it first
     if await is_on_interests_screen(page):
-        print("[*] Detected interests screen inside profile switcher! Dismissing it now...", flush=True)
+        print("[*] Dismissing interests screen...", flush=True)
         await handle_skip_onboarding(page)
         await asyncio.sleep(1.5)
 
-    print("[*] Checking if already on profile selection screen...", flush=True)
-    for _ in range(8):
+    if await is_on_select_profile_screen(page):
+        print("[+] Arrived on profile selection screen after dismiss!", flush=True)
+        return True
+
+    for _ in range(5):
         if await is_on_select_profile_screen(page):
-            print("[+] Already on profile selection screen!", flush=True)
+            print("[+] Profile selection screen ready!", flush=True)
             return True
         await asyncio.sleep(0.8)
 
-    # If accidentally on /hub/profile, return to home first
-    if "/hub/profile" in page.url:
-        print("[!] Detected on /hub/profile! Returning to home...", flush=True)
-        await page.goto("https://shahid.mbc.net/ar/home", wait_until="domcontentloaded")
-        await asyncio.sleep(2.5)
-
-    # 2. Strict UI flow retry loop (Avatar -> تغير الملف الشخصي -> Wait for plus icon)
+    # 2. UI flow retry loop (Avatar -> تغير الملف الشخصي -> Wait for plus icon)
     for attempt in range(3):
         print(f"[*] Navigating to profiles screen via avatar menu (attempt {attempt+1}/3)...", flush=True)
         await remove_cookie_banner(page)
@@ -1431,44 +1519,33 @@ async def navigate_to_select_profile_screen(page: Page) -> bool:
             print("[+] Arrived on profile screen!", flush=True)
             return True
 
-        if "/hub/profile" in page.url:
-            print("[!] On /hub/profile, returning to home...", flush=True)
-            await page.goto("https://shahid.mbc.net/ar/home", wait_until="domcontentloaded")
-            await asyncio.sleep(2.5)
-
         avatar_opened = await open_avatar_dropdown(page)
         if await is_on_select_profile_screen(page):
-            print("[+] Arrived on profile screen!", flush=True)
             return True
 
-        if not avatar_opened:
-            print(f"[*] Retrying open avatar dropdown...", flush=True)
-            await asyncio.sleep(2.0)
-            continue
+        if avatar_opened:
+            clicked = await click_change_profile_span(page)
+            if clicked:
+                for _ in range(10):
+                    if await is_on_select_profile_screen(page):
+                        print("[+] Arrived on profile screen via menu!", flush=True)
+                        return True
+                    await asyncio.sleep(0.8)
 
-        clicked = await click_change_profile_span(page)
-        if not clicked:
-            print(f"[*] 'تغير الملف الشخصي' click retry...", flush=True)
-            await asyncio.sleep(2.0)
-            continue
+        # Fallback if menu didn't navigate: navigate directly to /ar/hub/profile
+        if attempt == 2 and not await is_on_select_profile_screen(page):
+            try:
+                print("[*] Directly opening https://shahid.mbc.net/ar/hub/profile...", flush=True)
+                await page.goto("https://shahid.mbc.net/ar/hub/profile", wait_until="domcontentloaded")
+                await asyncio.sleep(2.0)
+                if await is_on_select_profile_screen(page):
+                    return True
+            except Exception:
+                pass
 
-        # Wait up to 12s for profile selection screen to appear
-        print("[*] Waiting for profile selection screen to load after click...", flush=True)
-        for _ in range(12):
-            if await is_on_select_profile_screen(page):
-                print("[+] Arrived on profile screen via menu!", flush=True)
-                return True
+        await asyncio.sleep(1.5)
 
-            if "/hub/profile" in page.url:
-                print("[!] Accidental navigation to /hub/profile detected! Returning to home...", flush=True)
-                await page.goto("https://shahid.mbc.net/ar/home", wait_until="domcontentloaded")
-                await asyncio.sleep(2.5)
-                break
-
-            await asyncio.sleep(1.0)
-
-    print(f"[*] URL at profile screen: {page.url}", flush=True)
-    return False
+    return await is_on_select_profile_screen(page)
 
 
 async def click_add_profile(page: Page) -> bool:
@@ -1476,21 +1553,19 @@ async def click_add_profile(page: Page) -> bool:
     print("[*] Clicking '+' / 'إضافة' to open modal...", flush=True)
     await remove_cookie_banner(page)
 
-    # 1. Check if modal is ALREADY open
-    modal_input = page.locator("input#profileName, input[placeholder*='الاسم'], input[placeholder*='اسم'], input[placeholder*='ادخل'], form input[type='text']:visible").first
+    # 1. Check if modal is ALREADY open (look for the real profile modal input, NOT search bar!)
+    modal_input_sel = "input[placeholder*='ادخل الاسم'], input[placeholder*='الاسم']:not([placeholder*='ابحث']), div[role='dialog'] input"
     try:
-        if await modal_input.is_visible(timeout=600):
+        if await page.locator(modal_input_sel).first.is_visible(timeout=500):
             print("[+] Add profile modal is already open!", flush=True)
             return True
     except Exception:
         pass
 
-    # Locators for plus icon / circle / text
     plus_targets = [
-        "[data-testid='SelectProfilePage_profile-plus-icon'] .rounded-full",
-        "[data-testid='SelectProfilePage_profile-plus-icon'] img[alt='اضف ملف']",
-        "[data-testid='SelectProfilePage_profile-plus-icon'] img",
         "[data-testid='SelectProfilePage_profile-plus-icon']",
+        "[data-testid='SelectProfilePage_profile-plus-icon'] .rounded-full",
+        "[data-testid='SelectProfilePage_profile-plus-icon'] img",
         "[data-test='plus']",
         "img[alt='اضف ملف']",
         "p:text-is('إضافة')",
@@ -1502,77 +1577,82 @@ async def click_add_profile(page: Page) -> bool:
 
         # Check if modal opened in the meantime
         try:
-            if await modal_input.is_visible(timeout=400):
+            if await page.locator(modal_input_sel).first.is_visible(timeout=400):
                 print("[+] Add profile modal is open!", flush=True)
                 return True
         except Exception:
             pass
 
-        # Strategy A: Real Playwright click on the first visible plus element
+        # Strategy A: Playwright click
         clicked = False
         for sel in plus_targets:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=600):
+                if await loc.is_visible(timeout=500):
                     await loc.scroll_into_view_if_needed()
-                    await asyncio.sleep(0.2)
-                    await loc.click(timeout=2500)
+                    await asyncio.sleep(0.1)
+                    await loc.click(timeout=1500)
                     print(f"[+] Clicked '+' using locator: {sel}", flush=True)
                     clicked = True
                     break
             except Exception:
                 pass
 
-        # Strategy B: Click using mouse coordinates at center of circular plus icon
+        # Strategy B: Direct DOM click and event dispatch on the root plus container
         if not clicked:
             try:
-                loc = page.locator("[data-testid='SelectProfilePage_profile-plus-icon']").first
+                clicked = await page.evaluate("""() => {
+                    const plus = document.querySelector('[data-testid="SelectProfilePage_profile-plus-icon"]') ||
+                                 document.querySelector('[data-test="plus"]') ||
+                                 document.querySelector('img[alt="اضف ملف"]')?.closest('[data-testid], .cursor-pointer') ||
+                                 document.querySelector('img[alt="اضف ملف"]')?.parentElement;
+                    if (plus) {
+                        plus.scrollIntoView({ behavior: 'instant', block: 'center' });
+                        plus.click();
+                        plus.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                        plus.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                        plus.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        const circle = plus.querySelector('.rounded-full') || plus.querySelector('img');
+                        if (circle) circle.click();
+                        return true;
+                    }
+                    return false;
+                }""")
+                if clicked:
+                    print("[+] Dispatched click on plus container via JS", flush=True)
+            except Exception:
+                pass
+
+        # Strategy C: Click via bounding box
+        if not clicked:
+            try:
+                loc = page.locator("[data-testid='SelectProfilePage_profile-plus-icon'], [data-test='plus']").first
                 if await loc.is_visible(timeout=500):
                     box = await loc.bounding_box()
                     if box:
                         cx = box['x'] + box['width'] / 2
-                        cy = box['y'] + (box['height'] * 0.35)
+                        cy = box['y'] + (box['height'] * 0.4)
                         await page.mouse.click(cx, cy)
                         print(f"[+] Clicked '+' via mouse coordinates: ({cx}, {cy})", flush=True)
                         clicked = True
             except Exception:
                 pass
 
-        # Strategy C: Dispatch bubbling events in JavaScript directly on the plus circle
-        if not clicked:
-            try:
-                clicked = await page.evaluate("""() => {
-                    const plus = document.querySelector('[data-testid="SelectProfilePage_profile-plus-icon"]') ||
-                                 document.querySelector('img[alt="اضف ملف"]') ||
-                                 document.querySelector('[data-test="plus"]');
-                    if (plus) {
-                        const circle = plus.querySelector('.rounded-full') || plus.querySelector('img') || plus;
-                        circle.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-                        circle.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-                        circle.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                        circle.click();
-                        return true;
-                    }
-                    return false;
-                }""")
-            except Exception:
-                pass
-
-        # Check if modal opened (wait up to 3 seconds)
+        # Wait up to 3s to verify modal opened
         for _ in range(6):
             await asyncio.sleep(0.5)
             try:
-                if await modal_input.is_visible(timeout=500):
+                if await page.locator(modal_input_sel).first.is_visible(timeout=400):
                     print("[+] Add profile modal successfully opened (input field visible)!", flush=True)
                     return True
                 body_t = await page.locator("body").inner_text()
-                if any(k in body_t for k in ["ادخل الاسم", "اضافة ملف", "أضف ملف"]):
+                if any(k in body_t for k in ["اضافة ملف", "ادخل الاسم", "حساب أطفال"]):
                     print("[+] Add profile modal detected via text!", flush=True)
                     return True
             except Exception:
                 pass
 
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.8)
 
     print("[!] Failed to open add profile modal after 8 attempts.", flush=True)
     return False
@@ -1583,30 +1663,55 @@ async def fill_profile_name(page, profile_name: str, target_locator=None) -> boo
     await remove_cookie_banner(page)
     input_box = target_locator
     if not input_box:
+        # Strictly exclude search bar!
         selectors = [
-            "input[placeholder*='الاسم']",
-            "input[placeholder*='اسم']",
-            "input[placeholder*='ادخل']",
+            "input[placeholder*='ادخل الاسم']",
+            "input[placeholder*='الاسم']:not([placeholder*='ابحث'])",
+            "input[placeholder*='اسم']:not([placeholder*='ابحث'])",
+            "div[role='dialog'] input[type='text']",
+            "div[role='dialog'] input",
             "input#profileName",
-            "form input[type='text']:visible",
-            "input[type='text']:visible",
         ]
         for sel in selectors:
             try:
                 loc = page.locator(sel).first
-                if await loc.is_visible(timeout=1500):
+                if await loc.is_visible(timeout=1000):
                     input_box = loc
                     break
             except Exception:
                 pass
 
     if not input_box:
-        print("[!] Profile name input not found!", flush=True)
+        print("[!] Profile name input not found via selectors, searching visible non-search inputs...", flush=True)
+        try:
+            has_input = await page.evaluate("""() => {
+                const inputs = Array.from(document.querySelectorAll('input')).filter(el => {
+                    const rect = el.getBoundingClientRect();
+                    const ph = el.getAttribute('placeholder') || '';
+                    const id = el.getAttribute('id') || '';
+                    const name = el.getAttribute('name') || '';
+                    if (id.includes('search') || name.includes('search') || ph.includes('ابحث') || ph.includes('بحث')) return false;
+                    if (id.includes('onetrust') || id.includes('vendor')) return false;
+                    return rect.width > 50 && rect.height > 15;
+                });
+                if (inputs.length > 0) {
+                    inputs[0].setAttribute('data-target-profile-input', 'true');
+                    return true;
+                }
+                return false;
+            }""")
+            if has_input:
+                input_box = page.locator("input[data-target-profile-input='true']").first
+        except Exception:
+            pass
+
+    if not input_box:
+        print("[!] Profile name input could not be found!", flush=True)
         return False
 
     try:
         await input_box.scroll_into_view_if_needed()
-        await input_box.click(timeout=2500)
+        await input_box.click(timeout=2000)
     except Exception:
         try:
             await input_box.click(force=True)
@@ -1621,28 +1726,7 @@ async def fill_profile_name(page, profile_name: str, target_locator=None) -> boo
         pass
     await asyncio.sleep(0.2)
 
-    # 1. Type with sequential keyboard events
-    try:
-        await input_box.press_sequentially(profile_name, delay=random.randint(30, 60))
-    except Exception:
-        for c in profile_name:
-            await page.keyboard.type(c)
-            await asyncio.sleep(0.04)
-
-    await asyncio.sleep(0.3)
-
-    # 2. Check and fill fallback
-    try:
-        val = await input_box.input_value()
-        if val != profile_name:
-            await input_box.fill(profile_name)
-    except Exception:
-        try:
-            await input_box.fill(profile_name)
-        except Exception:
-            pass
-
-    # 3. Native React input setter and event dispatch directly on input_box to ensure state sync and clear 'هذه الخانة مطلوبة'
+    # 1. Native React input setter and event dispatch directly on input_box to ensure state sync and clear 'هذه الخانة مطلوبة'
     try:
         await input_box.evaluate("""(el, val) => {
             el.focus();
@@ -1652,29 +1736,26 @@ async def fill_profile_name(page, profile_name: str, target_locator=None) -> boo
             } else {
                 el.value = val;
             }
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
             el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: val }));
         }""", profile_name)
     except Exception:
-        try:
-            await page.evaluate("""(val) => {
-                const el = document.querySelector("input[placeholder*='الاسم'], input[placeholder*='ادخل'], input#profileName, form input[type='text']:visible, input[type='text']:visible");
-                if (el) {
-                    el.focus();
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-                    if (setter) setter.call(el, val); else el.value = val;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: val }));
-                }
-            }""", profile_name)
-        except Exception:
-            pass
+        pass
 
-    # 4. Trigger typing keys to finalize React form validation
+    # 2. Sequential typing and fill
     try:
-        await input_box.press("End")
+        await input_box.fill(profile_name)
+    except Exception:
+        pass
+
+    try:
+        await input_box.press_sequentially(profile_name, delay=30)
+    except Exception:
+        pass
+
+    # 3. Trigger typing keys to finalize React form validation
+    try:
         await input_box.press("Space")
         await asyncio.sleep(0.05)
         await input_box.press("Backspace")
@@ -1682,6 +1763,22 @@ async def fill_profile_name(page, profile_name: str, target_locator=None) -> boo
         pass
 
     await asyncio.sleep(0.5)
+
+    # 4. Verify value is set
+    try:
+        val = await input_box.input_value()
+        if val != profile_name:
+            print(f"[*] Value mismatch ('{val}' vs '{profile_name}'), forcing fill...", flush=True)
+            await input_box.fill(profile_name)
+            await input_box.evaluate("""(el, val) => {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                if (setter) setter.call(el, val); else el.value = val;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""", profile_name)
+    except Exception:
+        pass
+
     print(f"[+] Successfully filled profile name: '{profile_name}'", flush=True)
     return True
 
@@ -1701,7 +1798,7 @@ async def create_single_profile(page: Page, profile_name: str) -> bool:
     if not await is_on_select_profile_screen(page):
         await handle_skip_onboarding(page)
 
-    # 2. Ensure we are on profile selection screen ('اختر من يشاهد') with retry
+    # 2. Ensure we are on profile selection screen with retry
     on_screen = False
     for attempt in range(3):
         if await navigate_to_select_profile_screen(page):
@@ -1714,7 +1811,7 @@ async def create_single_profile(page: Page, profile_name: str) -> bool:
         print(f"[!] Could not reach profile screen for {profile_name}, aborting single profile attempt.", flush=True)
         return False
 
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(1.0)
 
     # 3. Click "+" / "إضافة" to open modal
     opened_modal = False
@@ -1733,62 +1830,42 @@ async def create_single_profile(page: Page, profile_name: str) -> bool:
 
     # 4. Enter profile name in modal
     print(f"[*] Typing '{profile_name}' into modal...", flush=True)
-    name_locators = [
-        "input[placeholder*='الاسم']",
-        "input[placeholder*='اسم']",
-        "input#profileName",
-        "form input[type='text']:visible",
-        "input[type='text']:visible",
-    ]
-    name_box = None
-    for sel in name_locators:
-        try:
-            loc = page.locator(sel).first
-            if await loc.is_visible(timeout=2500):
-                name_box = loc
-                break
-        except Exception:
-            pass
+    filled = await fill_profile_name(page, profile_name)
+    if not filled:
+        print(f"[!] Failed to fill profile name for {profile_name}", flush=True)
+        return False
 
-    if not name_box:
-        try:
-            name_box = page.locator("input[type='text']:visible, form input:visible").first
-            await name_box.wait_for(state="visible", timeout=6000)
-        except Exception as e:
-            print(f"[!] Name input not visible: {e}", flush=True)
-            return False
-
-    await name_box.click()
-    await page.keyboard.press("Control+A")
-    await page.keyboard.press("Backspace")
-    await asyncio.sleep(0.3)
-    await human_type_locator(page, name_box, profile_name)
     await asyncio.sleep(1.0)
 
-    # 5. Click "انشاء"
-    print(f"[*] Clicking 'انشاء' for {profile_name}...", flush=True)
+    # 5. Click "انشاء" (Wait until button is enabled! Never force click disabled button!)
+    print(f"[*] Waiting for 'انشاء' button to become enabled for {profile_name}...", flush=True)
     btn_selectors = [
         "button:has-text('انشاء')",
         "button:has-text('إنشاء')",
+        "div[role='dialog'] button:has-text('انشاء')",
+        "div[role='dialog'] button:has-text('إنشاء')",
         "button[type='submit']",
     ]
     created = False
-    for attempt in range(8):
+    for attempt in range(12):
         for s in btn_selectors:
             try:
                 loc = page.locator(s).last
-                if await loc.is_visible(timeout=1000) and not await loc.is_disabled():
-                    print(f"[*] 'انشاء' button is enabled. Waiting 3 seconds before clicking per user instruction...", flush=True)
-                    await asyncio.sleep(3.0)
-                    await loc.click(force=True)
-                    print(f"[+] Clicked 'انشاء' using selector: {s}", flush=True)
-                    created = True
-                    break
+                if await loc.is_visible(timeout=500):
+                    is_dis = await loc.is_disabled()
+                    if not is_dis:
+                        print(f"[*] 'انشاء' button is enabled. Waiting 2 seconds before clicking...", flush=True)
+                        await asyncio.sleep(2.0)
+                        await loc.click()
+                        print(f"[+] Clicked 'انشاء' using selector: {s}", flush=True)
+                        created = True
+                        break
             except Exception:
                 pass
         if created:
             break
 
+        # Fallback: check via JS if button is enabled
         try:
             created = await page.evaluate("""() => {
                 const btns = Array.from(document.querySelectorAll('button'));
@@ -1802,17 +1879,23 @@ async def create_single_profile(page: Page, profile_name: str) -> bool:
                 }
                 return false;
             }""")
+            if created:
+                print("[+] Clicked enabled 'انشاء' via JS evaluate!", flush=True)
+                break
         except Exception:
             pass
-        if created:
-            break
+
+        # If button is still disabled after 3 attempts, re-trigger typing into input to clear validation
+        if attempt % 3 == 2:
+            print("[*] Button still disabled, re-verifying input...", flush=True)
+            await fill_profile_name(page, profile_name)
 
         await asyncio.sleep(0.8)
 
     if not created:
         print(f"[!] Warning: 'انشاء' button not confirmed for {profile_name}", flush=True)
 
-    await asyncio.sleep(4.0)
+    await asyncio.sleep(3.5)
 
     # 6. Skip onboarding / interests if shown after profile creation
     await handle_skip_onboarding(page)
@@ -1835,32 +1918,50 @@ async def automate_all_profiles(page: Page, status_msg, base_name: str = "dahoom
     # Step 1: First Profile on onboarding screen
     try:
         await remove_cookie_banner(page)
-        name_input = page.locator("input#profileName, input[placeholder*='اسم الملف'], input[placeholder*='الاسم'], input[type='text']:visible").first
-        await name_input.wait_for(state="visible", timeout=12000)
-        await human_type_locator(page, name_input, p1)
-        next_btn = page.locator("button:has-text('متابعة'), button[type='submit']").first
-        for _ in range(8):
-            if await next_btn.is_visible() and not await next_btn.is_disabled():
-                break
-            await asyncio.sleep(0.5)
+        print(f"[*] Setting up Profile 1: '{p1}'...", flush=True)
+        # Check if first profile input is on screen
+        has_p1_input = False
+        p1_selectors = [
+            "input#profileName",
+            "input[placeholder*='ادخل الاسم']",
+            "input[placeholder*='اسم الملف']",
+            "input[placeholder*='الاسم']:not([placeholder*='ابحث'])",
+        ]
+        for sel in p1_selectors:
+            try:
+                if await page.locator(sel).first.is_visible(timeout=2000):
+                    has_p1_input = True
+                    break
+            except Exception:
+                pass
 
-        print(f"[*] Profile 1 button is enabled. Waiting 2 seconds before clicking 'متابعة'...", flush=True)
-        await asyncio.sleep(2.0)
-        await next_btn.click()
-        # Resilient wait for Profile 1 transition with retry on network lag
-        for s in range(12):
-            await asyncio.sleep(1.0)
-            await remove_cookie_banner(page)
-            if not await page.locator("input#profileName").is_visible():
-                break
-            if s % 3 == 0:
-                try:
-                    if await next_btn.is_visible() and not await next_btn.is_disabled():
-                        print(f"[*] Retrying Profile 1 'متابعة' click due to network lag...", flush=True)
-                        await next_btn.click()
-                except Exception:
-                    pass
-        await asyncio.sleep(2.0)
+        if has_p1_input:
+            await fill_profile_name(page, p1)
+            next_btn = page.locator("button:has-text('متابعة'), button[type='submit']").first
+            for _ in range(8):
+                if await next_btn.is_visible() and not await next_btn.is_disabled():
+                    break
+                await asyncio.sleep(0.5)
+
+            print(f"[*] Profile 1 button is enabled. Waiting 2 seconds before clicking 'متابعة'...", flush=True)
+            await asyncio.sleep(2.0)
+            await next_btn.click()
+
+            for s in range(12):
+                await asyncio.sleep(1.0)
+                await remove_cookie_banner(page)
+                if not await page.locator("input#profileName").is_visible():
+                    break
+                if s % 3 == 0:
+                    try:
+                        if await next_btn.is_visible() and not await next_btn.is_disabled():
+                            print(f"[*] Retrying Profile 1 'متابعة' click due to network lag...", flush=True)
+                            await next_btn.click()
+                    except Exception:
+                        pass
+            await asyncio.sleep(2.0)
+        else:
+            print("[*] Profile 1 onboarding input not present, will handle via profile switcher...", flush=True)
     except Exception as e:
         print(f"[!] {p1} initial step note: {e}", flush=True)
 
@@ -1871,7 +1972,8 @@ async def automate_all_profiles(page: Page, status_msg, base_name: str = "dahoom
     # Step 2: Loop for profiles 2, 3, 4
     for prof in names_to_create[1:]:
         try:
-            await status_msg.edit_text(f"⏳ جاري إنشاء الملف الشخصي ({prof})...")
+            if status_msg:
+                await status_msg.edit_text(f"⏳ جاري إنشاء الملف الشخصي ({prof})...")
         except Exception:
             pass
 
@@ -2380,7 +2482,9 @@ async def launch_browser_and_request_otp(msg_target, session: RegistrationSessio
         host_disp = proxy_config.get("host") or proxy_config["server"].replace("http://", "").replace("https://", "")
         idx_disp = proxy_config.get("proxy_index", 1)
         tot_disp = proxy_config.get("total_proxies", 1)
-        proxy_display = f"🌐 **البروكسي المستخدم:** `{host_disp}` (#{idx_disp} من {tot_disp})\n\n"
+        p_type = proxy_config.get("proxy_type", "private")
+        type_str = "خاص بي" if p_type == "private" else ("عام مشترك" if p_type == "global" else "افتراضي")
+        proxy_display = f"🌐 **البروكسي المستخدم ({type_str}):** `{host_disp}` (#{idx_disp} من {tot_disp})\n\n"
         logger.info(f"Rotating Proxy picked: {host_disp} (#{idx_disp}/{tot_disp}) for user {u_id}")
 
     status_msg = await msg_target.reply_text(
@@ -4285,61 +4389,96 @@ async def save_queued_emails_step(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def show_proxies_panel(user_id: int, send_or_edit_fn, is_edit: bool = False) -> None:
-    info = get_user_proxy_info(user_id)
-    proxies = info.get("proxies", [])
-    count = len(proxies)
-    rotation_enabled = info.get("rotation_enabled", True)
-    cur_idx = info.get("current_index", 0)
+    user_info = get_user_proxy_info(user_id)
+    global_info = get_global_proxy_info()
 
+    user_proxies = user_info.get("proxies", [])
+    global_proxies = global_info.get("proxies", [])
+    u_count = len(user_proxies)
+    g_count = len(global_proxies)
+
+    mode = user_info.get("proxy_mode", "auto")
+    rotation_enabled = user_info.get("rotation_enabled", True)
+
+    mode_labels = {
+        "auto": "🔄 تلقائي (خاص أولاً، ثم عام مشترك)",
+        "private": "🔒 خاص بي فقط (لا تستخدم البروكسيات العامة)",
+        "global": "🌐 عام مشترك للجميع فقط",
+    }
+    mode_text = mode_labels.get(mode, "🔄 تلقائي")
     rot_status = "🟢 مفعّل (بروكسي جديد مع كل حساب)" if rotation_enabled else "🔴 معطّل (استخدام أول بروكسي)"
 
+    next_proxy = get_next_proxy_for_user(user_id)
+    if next_proxy:
+        p_t = next_proxy.get("proxy_type", "private")
+        t_label = "خاص بي" if p_t == "private" else ("عام مشترك" if p_t == "global" else "افتراضي")
+        next_disp = f"`{next_proxy['host']}` ({t_label})"
+    else:
+        next_disp = "*لا يوجد (اتصال مباشر)*"
+
     text = (
-        "🌐 **إدارة البروكسيات والتدوير التلقائي (Proxy Manager):**\n\n"
-        f"• **عدد البروكسيات المسجلة:** `{count}` بروكسي\n"
-        f"• **نظام التدوير التلقائي:** {rot_status}\n"
+        "🌐 **إدارة البروكسيات ونطاق الاستخدام (Proxy Manager):**\n\n"
+        f"• 🔒 **بروكسياتي الخاصة (لي فقط):** `{u_count}` بروكسي\n"
+        f"• 🌐 **البروكسيات العامة (المشتركة لكل المستخدمين):** `{g_count}` بروكسي\n"
+        f"• 🎛️ **وضع الاستخدام الحالي:** {mode_text}\n"
+        f"• 🔄 **نظام التدوير التلقائي:** {rot_status}\n"
+        f"• 🎯 **البروكسي التالي بالدور:** {next_disp}\n\n"
     )
 
-    if proxies:
-        next_p = proxies[cur_idx % count]
-        next_host = next_p.get("host") or next_p.get("server", "").replace("http://", "")
-        text += f"• **البروكسي التالي بالدور:** `{next_host}` (رقم {(cur_idx % count) + 1} من {count})\n\n"
+    if user_proxies:
+        preview_count = min(u_count, 5)
+        p_lines = [f"• `{p.get('host')}`" for p in user_proxies[:preview_count]]
+        if u_count > 5:
+            p_lines.append(f"*... والمزيد ({u_count - 5} بروكسي خاص)*")
+        text += "📋 **معاينة بروكسياتك الخاصة:**\n" + "\n".join(p_lines) + "\n\n"
 
-        preview_count = min(count, 8)
-        preview_lines = []
-        for i in range(preview_count):
-            p = proxies[i]
-            h = p.get("host") or p.get("server", "").replace("http://", "")
-            preview_lines.append(f"• `{h}`")
-        if count > 8:
-            preview_lines.append(f"*... والمزيد ({count - 8} بروكسي آخر)*")
-        text += "📋 **معاينة البروكسيات المسجلة:**\n" + "\n".join(preview_lines) + "\n\n"
-    else:
-        env_server = os.getenv("PROXY_SERVER")
-        if env_server:
-            text += f"• **البروكسي الافتراضي (.env):** `{env_server}`\n\n"
-        else:
-            text += "• **البروكسي:** *لا توجد بروكسيات مسجلة (اتصال مباشر)*\n\n"
-        text += "📭 *قائمتك فارغة حالياً. اضغط على '➕ إضافة / رفع بروكسيات' بالأسفل لبدء إضافتها.*\n\n"
+    if global_proxies:
+        preview_count = min(g_count, 5)
+        g_lines = [f"• `{p.get('host')}`" for p in global_proxies[:preview_count]]
+        if g_count > 5:
+            g_lines.append(f"*... والمزيد ({g_count - 5} بروكسي عام)*")
+        text += "📋 **معاينة البروكسيات العامة المشتركة:**\n" + "\n".join(g_lines) + "\n\n"
 
     text += (
-        "💡 **كيف تعمل هذه الميزة؟**\n"
-        "1️⃣ يمكنك إرسال ملف نصي `.txt` يحتوي على قائمة البروكسيات (مثل ملف Webshare) أو إرسالها كنص في الشات.\n"
-        "2️⃣ يدعم البوت صيغة `IP:PORT:USERNAME:PASSWORD` والصيغ القياسية الأخرى.\n"
-        "3️⃣ في كل عملية إنشاء حساب (فردي أو تلقائي)، يسحب البوت بروكسي جديد تلقائياً لضمان عدم حظر الـ IP!\n"
-        "4️⃣ يمكنك اختيار استبدال القائمة بالكامل أو دمج البروكسيات الجديدة مع القديمة."
+        "💡 **أنماط الاستخدام المدعومة:**\n"
+        "• **🔄 تلقائي (مدمج):** استخدام بروكسياتك الخاصة أولاً، وإن لم توجد يُستخدم البروكسي العام.\n"
+        "• **🔒 خاص بي فقط:** إنشاء الحسابات ببروكسياتك الخاصة حصراً دون مشاركة أي بروكسي عام.\n"
+        "• **🌐 عام مشترك:** استخدام البروكسيات العامة المتاحة لكافة مستخدمي البوت."
     )
 
+    user_is_adm = is_admin(user_id)
     rot_btn_text = "🔄 التدوير: 🟢 مفعّل" if rotation_enabled else "🔄 التدوير: 🔴 معطّل"
+
+    mode_btn_labels = {
+        "auto": "🎛️ الوضع: 🔄 تلقائي",
+        "private": "🎛️ الوضع: 🔒 خاص بي فقط",
+        "global": "🎛️ الوضع: 🌐 عام مشترك",
+    }
+    mode_btn_text = mode_btn_labels.get(mode, "🎛️ تبديل الوضع")
+
+    top_row = [
+        InlineKeyboardButton("➕ إضافة بروكسيات خاصة بي", callback_data="act_prompt_add_proxies"),
+    ]
+    if user_is_adm:
+        top_row.append(InlineKeyboardButton("🌐 إضافة بروكسيات عامة", callback_data="act_prompt_add_global_proxies"))
+
     buttons = [
+        top_row,
         [
-            InlineKeyboardButton("➕ إضافة / رفع بروكسيات", callback_data="act_prompt_add_proxies"),
+            InlineKeyboardButton(mode_btn_text, callback_data="act_cycle_proxy_mode"),
             InlineKeyboardButton(rot_btn_text, callback_data="act_toggle_proxy_rotation"),
         ]
     ]
-    if proxies:
-        buttons.append([
-            InlineKeyboardButton("🗑️ مسح جميع البروكسيات", callback_data="act_confirm_clear_proxies"),
-        ])
+
+    clear_row = []
+    if user_proxies:
+        clear_row.append(InlineKeyboardButton("🗑️ مسح بروكسياتي الخاصة", callback_data="act_confirm_clear_proxies"))
+    if user_is_adm and global_proxies:
+        clear_row.append(InlineKeyboardButton("🗑️ مسح البروكسيات العامة", callback_data="act_confirm_clear_global_proxies"))
+
+    if clear_row:
+        buttons.append(clear_row)
+
     buttons.append([
         InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="act_menu"),
     ])
@@ -4362,7 +4501,16 @@ async def proxies_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     context.user_data.pop("pending_proxies", None)
+    context.user_data.pop("proxy_target_scope", None)
     await show_proxies_panel(update.effective_user.id, query.message.edit_text, is_edit=True)
+
+
+async def cycle_proxy_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    new_mode = cycle_user_proxy_mode(user_id)
+    await show_proxies_panel(user_id, query.message.edit_text, is_edit=True)
 
 
 async def toggle_proxy_rotation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4378,12 +4526,12 @@ async def confirm_clear_proxies_callback(update: Update, context: ContextTypes.D
     await query.answer()
     markup = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🗑️ نعم، افرغ القائمة", callback_data="act_do_clear_proxies"),
+            InlineKeyboardButton("🗑️ نعم، افرغ بروكسياتي الخاصة", callback_data="act_do_clear_proxies"),
             InlineKeyboardButton("❌ تراجع", callback_data="act_proxies"),
         ]
     ])
     await query.message.edit_text(
-        "⚠️ **هل أنت متأكد من رغبتك في تفريغ ومسح جميع البروكسيات من قائمتك؟**\n\n"
+        "⚠️ **هل أنت متأكد من تفريغ ومسح بروكسياتك الخاصة؟**\n\n"
         "لا يمكن التراجع عن هذه الخطوة بعد التأكيد.",
         reply_markup=markup,
         parse_mode="Markdown"
@@ -4400,7 +4548,45 @@ async def do_clear_proxies_callback(update: Update, context: ContextTypes.DEFAUL
         [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="act_menu")],
     ])
     await query.message.edit_text(
-        "✅ **تم تفريغ ومسح قائمة البروكسيات بنجاح.**",
+        "✅ **تم تفريغ ومسح قائمة بروكسياتك الخاصة بنجاح.**",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+
+async def confirm_clear_global_proxies_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        await query.answer("⛔ هذا الخيار مخصص للمشرفين فقط.", show_alert=True)
+        return
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗑️ نعم، افرغ البروكسيات العامة للجميع", callback_data="act_do_clear_global_proxies"),
+            InlineKeyboardButton("❌ تراجع", callback_data="act_proxies"),
+        ]
+    ])
+    await query.message.edit_text(
+        "⚠️ **هل أنت متأكد من رغبتك في تفريغ ومسح البروكسيات العامة المشتركة لجميع المستخدمين؟**\n\n"
+        "لا يمكن التراجع عن هذه الخطوة بعد التأكيد.",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+
+async def do_clear_global_proxies_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        await query.answer("⛔ هذا الخيار مخصص للمشرفين فقط.", show_alert=True)
+        return
+    clear_global_proxies()
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 رجوع لإدارة البروكسيات", callback_data="act_proxies")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="act_menu")],
+    ])
+    await query.message.edit_text(
+        "✅ **تم تفريغ ومسح البروكسيات العامة المشتركة بنجاح.**",
         reply_markup=markup,
         parse_mode="Markdown"
     )
@@ -4408,10 +4594,18 @@ async def do_clear_proxies_callback(update: Update, context: ContextTypes.DEFAUL
 
 async def prompt_add_proxies_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    current_count = len(get_user_proxies(user_id))
+    target_scope = "user"
+    if update.callback_query and "global" in (update.callback_query.data or ""):
+        if is_admin(user_id):
+            target_scope = "global"
+
+    context.user_data["proxy_target_scope"] = target_scope
+    is_global = (target_scope == "global")
+    current_count = len(get_global_proxies()) if is_global else len(get_user_proxies(user_id))
+    scope_title = "🌐 العامة (المشتركة لكل مستخدمي البوت)" if is_global else "🔒 الخاصة بك (لك وحدك)"
 
     prompt = (
-        "📥 **أرسل الآن قائمة البروكسيات الجديدة التي تريد استخدامها:**\n\n"
+        f"📥 **أرسل الآن قائمة البروكسيات الجديدة ({scope_title}):**\n\n"
         f"• **البروكسيات المسجلة حالياً:** `{current_count}` بروكسي\n\n"
         "📌 **طرق الإرسال المدعومة:**\n"
         "1️⃣ أرسل ملف نصي `.txt` يحتوي على قائمة البروكسيات (مثل ملف Webshare).\n"
@@ -4438,8 +4632,12 @@ async def prompt_add_proxies_entry(update: Update, context: ContextTypes.DEFAULT
 
 async def save_proxies_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
-    raw_text = ""
+    target_scope = context.user_data.get("proxy_target_scope", "user")
+    is_global = (target_scope == "global")
+    target_key = "global" if is_global else str(user_id)
+    scope_title = "العامة المشتركة" if is_global else "الخاصة بك"
 
+    raw_text = ""
     if update.message.document:
         doc = update.message.document
         doc_name = (doc.file_name or "").lower()
@@ -4471,7 +4669,7 @@ async def save_proxies_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return INPUT_PROXIES
 
-    existing = get_user_proxies(user_id)
+    existing = get_global_proxies() if is_global else get_user_proxies(user_id)
     if existing:
         context.user_data["pending_proxies"] = parsed
         markup = InlineKeyboardMarkup([
@@ -4486,8 +4684,8 @@ async def save_proxies_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             ]
         ])
         await update.message.reply_text(
-            f"📥 **تم التعرف على `{len(parsed)}` بروكسي صالح!**\n\n"
-            f"⚠️ **لديك بالفعل `{len(existing)}` بروكسي مسجل في قائمتك.**\n\n"
+            f"📥 **تم التعرف على `{len(parsed)}` بروكسي صالح في القائمة ({scope_title})!**\n\n"
+            f"⚠️ **لديك بالفعل `{len(existing)}` بروكسي مسجل في هذه القائمة.**\n\n"
             "👇 **كيف ترغب في حفظ البروكسيات الجديدة؟**\n"
             "• **استبدال:** مسح البروكسيات القديمة وبدء قائمة جديدة.\n"
             "• **إبقاء ودمج:** إضافة البروكسيات الجديدة وتخطي المكرر.",
@@ -4496,17 +4694,18 @@ async def save_proxies_step(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return CONFIRM_PROXY_MODE
     else:
-        added, dup, total = add_user_proxies(user_id, parsed, replace=True)
+        added, dup, total = add_proxies_to_target(target_key, parsed, replace=True)
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("🌐 عرض قائمة البروكسيات", callback_data="act_proxies")],
             [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="act_menu")],
         ])
         await update.message.reply_text(
-            f"✅ **تم حفظ `{total}` بروكسي بنجاح في قائمتك!**\n\n"
+            f"✅ **تم حفظ `{total}` بروكسي بنجاح في القائمة ({scope_title})!**\n\n"
             "🔄 **التدوير التلقائي مفعّل:** في كل عملية إنشاء حساب، سيتم استخدام بروكسي جديد مختلف بالترتيب.",
             reply_markup=markup,
             parse_mode="Markdown"
         )
+        context.user_data.pop("proxy_target_scope", None)
         return ConversationHandler.END
 
 
@@ -4514,24 +4713,30 @@ async def proxy_replace_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    target_scope = context.user_data.get("proxy_target_scope", "user")
+    is_global = (target_scope == "global")
+    target_key = "global" if is_global else str(user_id)
+    scope_title = "العامة المشتركة" if is_global else "الخاصة بك"
+
     pending = context.user_data.pop("pending_proxies", [])
     if not pending:
         await query.message.edit_text("⚠️ لا توجد بروكسيات معلقة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="act_proxies")]]))
         return ConversationHandler.END
 
-    added, dup, total = add_user_proxies(user_id, pending, replace=True)
+    added, dup, total = add_proxies_to_target(target_key, pending, replace=True)
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🌐 عرض قائمة البروكسيات", callback_data="act_proxies")],
         [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="act_menu")],
     ])
     await query.message.edit_text(
-        f"✅ **تم استبدال البروكسيات السابقة بنجاح!**\n\n"
+        f"✅ **تم استبدال البروكسيات السابقة في القائمة ({scope_title}) بنجاح!**\n\n"
         f"• تم مسح البروكسيات القديمة بالكامل.\n"
         f"• إجمالي البروكسيات الجديدة المسجلة: `{total}` بروكسي\n"
         "🔄 تم ضبط مؤشر التدوير للبدء من أول بروكسي جديد.",
         reply_markup=markup,
         parse_mode="Markdown"
     )
+    context.user_data.pop("proxy_target_scope", None)
     return ConversationHandler.END
 
 
@@ -4539,25 +4744,216 @@ async def proxy_append_callback(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    target_scope = context.user_data.get("proxy_target_scope", "user")
+    is_global = (target_scope == "global")
+    target_key = "global" if is_global else str(user_id)
+    scope_title = "العامة المشتركة" if is_global else "الخاصة بك"
+
     pending = context.user_data.pop("pending_proxies", [])
     if not pending:
         await query.message.edit_text("⚠️ لا توجد بروكسيات معلقة.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="act_proxies")]]))
         return ConversationHandler.END
 
-    added, dup, total = add_user_proxies(user_id, pending, replace=False)
+    added, dup, total = add_proxies_to_target(target_key, pending, replace=False)
     markup = InlineKeyboardMarkup([
         [InlineKeyboardButton("🌐 عرض قائمة البروكسيات", callback_data="act_proxies")],
         [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="act_menu")],
     ])
     await query.message.edit_text(
-        f"✅ **تم دمج البروكسيات الجديدة بنجاح!**\n\n"
+        f"✅ **تم دمج البروكسيات الجديدة في القائمة ({scope_title}) بنجاح!**\n\n"
         f"• البروكسيات المضافة حديثاً: `{added}`\n"
         f"• البروكسيات المكررة (تم تخطيها): `{dup}`\n"
         f"• إجمالي البروكسيات المتاحة الآن: `{total}` بروكسي",
         reply_markup=markup,
         parse_mode="Markdown"
     )
+    context.user_data.pop("proxy_target_scope", None)
     return ConversationHandler.END
+
+
+
+async def admin_backup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        if update.callback_query:
+            await update.callback_query.answer("⛔ هذا الخيار مخصص للمشرفين فقط.", show_alert=True)
+        else:
+            await update.effective_message.reply_text("⛔ هذا الخيار مخصص للمشرفين فقط.")
+        return
+
+    if update.callback_query:
+        await update.callback_query.answer("⏳ جاري تجهيز النسخة الاحتياطية الشاملة...")
+
+    status_msg = await update.effective_message.reply_text("⏳ جاري إنشاء وضغط النسخة الاحتياطية الشاملة لكافة البيانات...")
+
+    import io, tarfile, json
+    from datetime import datetime
+
+    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    files_to_backup = [
+        "accounts.json",
+        "proxies.json",
+        "admins.json",
+        "subscribers.json",
+        "settings.json",
+        "queued_emails.json",
+        ".env",
+    ]
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    bio = io.BytesIO()
+    stats = {}
+
+    with tarfile.open(fileobj=bio, mode="w:gz") as tar:
+        for fname in files_to_backup:
+            fpath = os.path.join(base_dir, fname)
+            if os.path.exists(fpath):
+                tar.add(fpath, arcname=fname)
+                try:
+                    if fname.endswith(".json"):
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            d = json.load(f)
+                            if fname == "accounts.json" and isinstance(d, dict):
+                                tot = sum(len(v) for v in d.values() if isinstance(v, list))
+                                stats[fname] = f"{tot} حساب ({len(d)} مستخدم)"
+                            elif fname == "proxies.json" and isinstance(d, dict):
+                                tot = sum(len(v) for v in d.values() if isinstance(v, list))
+                                glob = len(d.get("global", []))
+                                stats[fname] = f"{tot} بروكسي (منها {glob} عامة)"
+                            elif isinstance(d, (list, dict)):
+                                stats[fname] = f"{len(d)} عنصر"
+                            else:
+                                stats[fname] = "1"
+                    else:
+                        stats[fname] = "محفوظ بنجاح"
+                except Exception:
+                    stats[fname] = "تم نسخه"
+            else:
+                stats[fname] = "غير موجود"
+
+    bio.seek(0)
+    bio.name = f"backup_{now_str}.tar.gz"
+
+    caption = (
+        "📦 **النسخة الاحتياطية الشاملة لكافة بيانات البوت**\n\n"
+        f"📅 **التاريخ:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
+        f"• الحسابات (accounts.json): {stats.get('accounts.json', '0')}\n"
+        f"• البروكسيات (proxies.json): {stats.get('proxies.json', '0')}\n"
+        f"• المشرفين (admins.json): {stats.get('admins.json', '0')}\n"
+        f"• المشتركين (subscribers.json): {stats.get('subscribers.json', '0')}\n"
+        f"• الإعدادات (settings.json): {stats.get('settings.json', '0')}\n"
+        f"• قائمة الإيميلات (queued_emails): {stats.get('queued_emails.json', '0')}\n"
+        f"• ملف البيئة (.env): {stats.get('.env', 'غير موجود')}\n\n"
+        "💡 *يمكنك استعادة هذه النسخة في أي وقت من السيرفر عبر خيار 10 أو عبر إرسال هذا الملف للبوت مع تعليق /restore*"
+    )
+
+    await update.effective_message.reply_document(
+        document=bio,
+        caption=caption,
+        parse_mode="Markdown"
+    )
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+
+async def process_restore_document(update: Update, context: ContextTypes.DEFAULT_TYPE, doc) -> None:
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    status_msg = await update.effective_message.reply_text("⏳ جاري تحميل وفحص النسخة الاحتياطية الشاملة...")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    tmp_path = os.path.join(base_dir, f"tmp_restore_{user_id}.tar.gz")
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(tmp_path)
+
+        import tarfile, zipfile
+        if tarfile.is_tarfile(tmp_path):
+            with tarfile.open(tmp_path, "r:gz") as tar:
+                for member in tar.getmembers():
+                    if not member.name.startswith("/") and ".." not in member.name:
+                        tar.extract(member, path=base_dir)
+        elif zipfile.is_zipfile(tmp_path):
+            with zipfile.ZipFile(tmp_path, "r") as zf:
+                for member in zf.namelist():
+                    if not member.startswith("/") and ".." not in member:
+                        zf.extract(member, path=base_dir)
+        else:
+            raise ValueError("صيغة الملف غير مدعومة (يجب أن يكون .tar.gz أو .zip)")
+
+        # Defensive JSON checks
+        for fn in ["accounts.json", "proxies.json", "queued_emails.json", "subscribers.json", "settings.json"]:
+            fp = os.path.join(base_dir, fn)
+            if os.path.exists(fp):
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if not isinstance(data, dict):
+                        with open(fp, "w", encoding="utf-8") as f:
+                            json.dump({}, f)
+                except Exception:
+                    with open(fp, "w", encoding="utf-8") as f:
+                        json.dump({}, f)
+
+        fp = os.path.join(base_dir, "admins.json")
+        if os.path.exists(fp):
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, list):
+                    with open(fp, "w", encoding="utf-8") as f:
+                        json.dump([PRIMARY_ADMIN_ID], f)
+            except Exception:
+                with open(fp, "w", encoding="utf-8") as f:
+                    json.dump([PRIMARY_ADMIN_ID], f)
+
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+        await status_msg.edit_text(
+            "✅ **تمت استعادة كافة البيانات والبروكسيات والمشتركين بنجاح!**\n\n"
+            "💾 أصبحت كافة الحسابات والبروكسيات والإعدادات مفعلة الآن في البوت.",
+            parse_mode="Markdown"
+        )
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        await status_msg.edit_text(f"❌ حدث خطأ أثناء الاستعادة: `{exc}`", parse_mode="Markdown")
+
+
+async def admin_restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.effective_message.reply_text("⛔ عذراً، هذا الخيار مخصص للمشرفين فقط.")
+        return
+
+    reply = update.message.reply_to_message if update.message else None
+    if reply and reply.document:
+        return await process_restore_document(update, context, reply.document)
+
+    text = (
+        "📥 **طريقة الاستيراد والاستعادة الشاملة من Telegram:**\n\n"
+        "1️⃣ أرسل ملف النسخة الاحتياطية (`backup_*.tar.gz` أو `.zip`).\n"
+        "2️⃣ أضف في خانة التعليق (Caption) الأمر: `/restore`\n\n"
+        "💡 *أو قم بالرد (Reply) على أي ملف نسخة احتياطية تم إرساله مسبقاً بالأمر `/restore` وسيتم استرجاع كافة البيانات فوراً.*"
+    )
+    await update.effective_message.reply_text(text, parse_mode="Markdown")
+
+
+async def admin_restore_doc_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    doc = update.message.document if update.message else None
+    if not doc:
+        return
+    caption = (update.message.caption or "").strip()
+    if "/restore" in caption or "/import" in caption:
+        await process_restore_document(update, context, doc)
 
 
 def main() -> None:
@@ -4587,7 +4983,7 @@ def main() -> None:
             CallbackQueryHandler(handle_batch_count_choice, pattern="^act_choose_manual$"),
             CallbackQueryHandler(handle_batch_count_choice, pattern="^act_choose_queue$"),
             CallbackQueryHandler(prompt_add_emails_entry, pattern="^act_prompt_add_emails$"),
-            CallbackQueryHandler(prompt_add_proxies_entry, pattern="^act_prompt_add_proxies$"),
+            CallbackQueryHandler(prompt_add_proxies_entry, pattern="^(act_prompt_add_proxies|act_prompt_add_global_proxies)$"),
             CallbackQueryHandler(proxies_callback, pattern="^act_proxies$"),
             CallbackQueryHandler(edit_perm_pass_entry, pattern="^act_edit_perm_pass$"),
             CallbackQueryHandler(edit_perm_name_entry, pattern="^act_edit_perm_name$"),
@@ -4694,6 +5090,11 @@ def main() -> None:
     app.add_handler(CommandHandler("password", perm_pass_command))
     app.add_handler(CommandHandler("name", perm_name_command))
     app.add_handler(CommandHandler("profilename", perm_name_command))
+    app.add_handler(CommandHandler("backup", admin_backup_handler))
+    app.add_handler(CommandHandler("backups", admin_backup_handler))
+    app.add_handler(CommandHandler("restore", admin_restore_command))
+    app.add_handler(CallbackQueryHandler(admin_backup_handler, pattern="^act_admin_backup$"))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"/(?:restore|import)"), admin_restore_doc_message_handler))
     app.add_handler(CommandHandler("subs", subs_command))
     app.add_handler(CommandHandler("subscribers", subs_command))
     app.add_handler(CommandHandler("addsub", add_sub_command))
@@ -4724,9 +5125,12 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(do_clear_queue_callback, pattern="^act_do_clear_queue$"))
     app.add_handler(CallbackQueryHandler(proxies_callback, pattern="^act_proxies$"))
     app.add_handler(CallbackQueryHandler(prompt_add_proxies_entry, pattern="^act_prompt_add_proxies$"))
+    app.add_handler(CallbackQueryHandler(cycle_proxy_mode_callback, pattern="^act_cycle_proxy_mode$"))
     app.add_handler(CallbackQueryHandler(toggle_proxy_rotation_callback, pattern="^act_toggle_proxy_rotation$"))
     app.add_handler(CallbackQueryHandler(confirm_clear_proxies_callback, pattern="^act_confirm_clear_proxies$"))
     app.add_handler(CallbackQueryHandler(do_clear_proxies_callback, pattern="^act_do_clear_proxies$"))
+    app.add_handler(CallbackQueryHandler(confirm_clear_global_proxies_callback, pattern="^act_confirm_clear_global_proxies$"))
+    app.add_handler(CallbackQueryHandler(do_clear_global_proxies_callback, pattern="^act_do_clear_global_proxies$"))
     app.add_handler(CallbackQueryHandler(proxy_replace_callback, pattern="^act_proxy_replace$"))
     app.add_handler(CallbackQueryHandler(proxy_append_callback, pattern="^act_proxy_append$"))
     app.add_handler(CallbackQueryHandler(perm_pass_callback, pattern="^act_perm_pass$"))
